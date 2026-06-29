@@ -1,0 +1,12 @@
+firmware/main/secrets.h
+firmware/managed_components/
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+bridge/.env
+bridge/__pycache__/
+scripts/node_modules/
+scripts/cf*.c
+scripts/custom_font_*.c
+*.bin
+*.log
