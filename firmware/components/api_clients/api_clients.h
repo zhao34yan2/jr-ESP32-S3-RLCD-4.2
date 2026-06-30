@@ -19,12 +19,19 @@ typedef struct {
 #define MAX_FUNDS 3
 
 /* 天气信息 */
+#define FORECAST_DAYS 3
+
 typedef struct {
     float temp_outdoor;      /* 室外温度 */
     float temp_min;          /* 最低温 */
     float temp_max;          /* 最高温 */
     char condition[24];      /* 天气状况 (晴/阴/雨) */
     int   pm25;              /* PM2.5 */
+    /* 未来几天预报 */
+    float fc_min[FORECAST_DAYS];
+    float fc_max[FORECAST_DAYS];
+    char fc_cond[FORECAST_DAYS][12];
+    int  fc_count;
 } WeatherData_t;
 
 /* 积存金 (黄金) 信息 — 元/克 */
@@ -79,6 +86,9 @@ typedef struct {
 
     /* DeepSeek */
     DeepSeekData_t ds;
+
+    /* 电池 */
+    int battery_pct;         /* 0~100 */
 
     /* 刷新时间 */
     char last_update[10];    /* HH:MM */

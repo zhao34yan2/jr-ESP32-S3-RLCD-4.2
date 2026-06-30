@@ -117,13 +117,27 @@ static char *http_get_short(const char *url)
     return buf;
 }
 
+/* ===== Weather code → Chinese ===== */
+static const char *code_to_cond(int w)
+{
+    if (w <= 3) return "晴";
+    if (w <= 20) return "阴";
+    if (w <= 50) return "雾";
+    if (w <= 60) return "小雨";
+    if (w <= 70) return "中雨";
+    if (w <= 80) return "大雨";
+    if (w <= 86) return "雪";
+    return "雨";
+}
+
 /* ===== Weather (open-meteo) ===== */
 esp_err_t api_fetch_weather(WeatherData_t *out)
 {
     char url[512];
     snprintf(url, sizeof(url),
              "http://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
-             "&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min&timezone=Asia/Shanghai",
+             "&current=temperature_2m,weather_code"
+             "&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=Asia/Shanghai",
              WEATHER_LAT, WEATHER_LON);
     ESP_LOGI(TAG, "Fetching weather: %s", url);
 
@@ -142,21 +156,43 @@ esp_err_t api_fetch_weather(WeatherData_t *out)
             out->temp_outdoor = (float)item->valuedouble;
         if ((item = cJSON_GetObjectItem(cur, "weather_code"))) {
             int w = (int)item->valuedouble;
-            if (w <= 3) strcpy(out->condition, "晴");
-            else if (w <= 20) strcpy(out->condition, "阴");
-            else if (w <= 50) strcpy(out->condition, "雾");
-            else if (w <= 60) strcpy(out->condition, "小雨");
-            else if (w <= 70) strcpy(out->condition, "中雨");
-            else if (w <= 80) strcpy(out->condition, "大雨");
-            else if (w <= 86) strcpy(out->condition, "雪");
-            else strcpy(out->condition, "雨");
+            strcpy(out->condition, code_to_cond(w));
         }
+
         cJSON *tmax = cJSON_GetObjectItem(day, "temperature_2m_max");
         cJSON *tmin = cJSON_GetObjectItem(day, "temperature_2m_min");
         if (tmax && cJSON_IsArray(tmax) && cJSON_GetArraySize(tmax) > 0)
             out->temp_max = (float)cJSON_GetArrayItem(tmax, 0)->valuedouble;
         if (tmin && cJSON_IsArray(tmin) && cJSON_GetArraySize(tmin) > 0)
             out->temp_min = (float)cJSON_GetArrayItem(tmin, 0)->valuedouble;
+
+        /* 多日预报 */
+        out->fc_count = 0;
+        cJSON *fc_code = cJSON_GetObjectItem(day, "weather_code");
+        cJSON *fc_time = cJSON_GetObjectItem(day, "time");
+        int fc_sz = 0;
+        if (fc_time && cJSON_IsArray(fc_time)) fc_sz = cJSON_GetArraySize(fc_time);
+        if (fc_sz > FORECAST_DAYS) fc_sz = FORECAST_DAYS;
+        for (int i = 0; i < fc_sz; i++) {
+            if (tmin && i < (int)cJSON_GetArraySize(tmin))
+                out->fc_min[i] = (float)cJSON_GetArrayItem(tmin, i)->valuedouble;
+            if (tmax && i < (int)cJSON_GetArraySize(tmax))
+                out->fc_max[i] = (float)cJSON_GetArrayItem(tmax, i)->valuedouble;
+            if (fc_code && i < (int)cJSON_GetArraySize(fc_code)) {
+                int wc = (int)cJSON_GetArrayItem(fc_code, i)->valuedouble;
+                const char *src = code_to_cond(wc);
+                /* 手动复制, 避免 strlcpy 潜在问题 */
+                int j = 0;
+                while (src[j] && j < (int)sizeof(out->fc_cond[i]) - 1) {
+                    out->fc_cond[i][j] = src[j];
+                    j++;
+                }
+                out->fc_cond[i][j] = '\0';
+                ESP_LOGI(TAG, "FC[%d]: code=%d -> len=%d", i, wc, j);
+            }
+            out->fc_count++;
+        }
+
         out->pm25 = 0;
         cJSON_Delete(root);
         ESP_LOGI(TAG, "Weather: %.1fC %s", out->temp_outdoor, out->condition);

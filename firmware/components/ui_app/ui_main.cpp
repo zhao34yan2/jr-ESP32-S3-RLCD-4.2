@@ -27,7 +27,6 @@
 #include <cstring>
 #include <ctime>
 #include <esp_log.h>
-#include <esp_adc/adc_oneshot.h>
 #include <lvgl.h>
 #include "ui_main.h"
 #include "wifi_app.h"
@@ -61,27 +60,6 @@ static const char *TAG = "UI";
 static lv_obj_t *ui_status_time;
 static lv_obj_t *ui_status_date;
 static lv_obj_t *ui_battery;
-
-/* 电池 ADC (GPIO4 = ADC1_CH3) */
-static adc_oneshot_unit_handle_t adc_handle = NULL;
-
-static int read_battery_pct(void)
-{
-    if (!adc_handle) {
-        adc_oneshot_unit_init_cfg_t init_cfg = { .unit_id = ADC_UNIT_1 };
-        adc_oneshot_new_unit(&init_cfg, &adc_handle);
-        adc_oneshot_chan_cfg_t chan_cfg = { .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_12 };
-        adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_3, &chan_cfg);
-    }
-    int raw = 0;
-    adc_oneshot_read(adc_handle, ADC_CHANNEL_3, &raw);
-    /* 3倍分压: 满电4.2V→ADC≈1737, 空电3.3V→ADC≈1364 */
-    ESP_LOGI("BAT", "ADC raw=%d", raw);
-    int pct = (raw - 1100) * 100 / (1650 - 1100);
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    return pct;
-}
 static lv_obj_t *ui_weather_text;
 static lv_obj_t *ui_weather_indoor;
 static lv_obj_t *ui_gold_text;
@@ -335,8 +313,7 @@ void ui_update_all(const AppData_t *app)
 
     /* 电池 */
     if (ui_battery) {
-        int pct = read_battery_pct();
-        snprintf(buf, sizeof(buf), "电量 %d%%", pct);
+        snprintf(buf, sizeof(buf), "电量 %d%%", app->battery_pct);
         lv_label_set_text(ui_battery, buf);
     }
 

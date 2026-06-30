@@ -18,15 +18,16 @@ import logging
 from datetime import datetime
 
 from dotenv import load_dotenv
+
+# ⚠️ 必须先加载 .env, 再 import deepseek (否则环境变量为空)
+load_dotenv()
+
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from schema import UsageResponse
 from sources.deepseek import fetch_deepseek_data, DEEPSEEK_API_KEY
-
-# 加载 .env
-load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -111,10 +112,19 @@ async def get_fund(code: str):
             resp = await client.get(url)
             text = resp.text
             # 提取最新净值: Data_netWorthTrend = [{...},...,{"x":...,"y":1.2345,...}]
-            import re, json
-            m = re.search(r'Data_netWorthTrend\s*=\s*(\[.*?\]);', text, re.DOTALL)
-            if m:
-                data = json.loads(m.group(1))
+            import json
+            # 手动找匹配的括号: Data_netWorthTrend = [ ... ];
+            start = text.find('Data_netWorthTrend = [')
+            if start >= 0:
+                start += len('Data_netWorthTrend = [')
+                depth = 1
+                i = start
+                while i < len(text) and depth > 0:
+                    if text[i] == '[': depth += 1
+                    elif text[i] == ']': depth -= 1
+                    i += 1
+                json_str = text[start:i-1]
+                data = json.loads('[' + json_str + ']')
                 if data:
                     nav = float(data[-1]['y'])
                     logger.info(f"Fund {code} NAV: {nav}")
