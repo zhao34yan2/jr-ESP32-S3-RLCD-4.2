@@ -98,25 +98,6 @@ static char *http_get(const char *url)
     return buf;
 }
 
-/* ===== HTTPS GET using esp_http_client ===== */
-static char *http_get_short(const char *url)
-{
-    esp_http_client_config_t cfg = {0};
-    cfg.url = url; cfg.timeout_ms = 2000; cfg.buffer_size = 1024;
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) return NULL;
-    char *buf = (char *)malloc(1024);
-    if (!buf) { esp_http_client_cleanup(client); return NULL; }
-    memset(buf, 0, 1024);
-    esp_err_t err = esp_http_client_perform(client);
-    if (err == ESP_OK) {
-        int len = esp_http_client_read(client, buf, 1023);
-        if (len > 0) buf[len] = '\0';
-    }
-    esp_http_client_cleanup(client);
-    return buf;
-}
-
 /* ===== Weather code → Chinese ===== */
 static const char *code_to_cond(int w)
 {
@@ -188,7 +169,6 @@ esp_err_t api_fetch_weather(WeatherData_t *out)
                     j++;
                 }
                 out->fc_cond[i][j] = '\0';
-                ESP_LOGI(TAG, "FC[%d]: code=%d -> len=%d", i, wc, j);
             }
             out->fc_count++;
         }
@@ -223,10 +203,10 @@ esp_err_t api_fetch_gold(GoldData_t *out)
         char *val = tok;
         while (*val == ' ') val++;
         switch (field) {
-            case 4: out->low   = (float)atof(val); break;
-            case 5: out->high  = (float)atof(val); break;
-            case 6: out->price = (float)atof(val); break;
             case 2: { float pv = (float)atof(val); out->change = out->price - pv; break; }
+            case 3: { float v = (float)atof(val); if (v > 0.001f) out->high  = v; break; }
+            case 4: { float v = (float)atof(val); if (v > 0.001f) out->low   = v; break; }
+            case 6: { float v = (float)atof(val); if (v > 0.001f) out->price = v; break; }
         }
         tok = comma;
         field++;
@@ -243,12 +223,14 @@ esp_err_t api_fetch_silver(SilverData_t *out) { return ESP_FAIL; }
 /* ===== Funds (fundgz + bridge fallback) ===== */
 esp_err_t api_fetch_funds(FundItem_t *funds, int *count)
 {
-    *count = 0;
+    int got = 0;
     for (int i = 0; i < s_fund_count && i < MAX_FUNDS; i++) {
         FundItem_t *f = &funds[i];
-        memset(f, 0, sizeof(FundItem_t));
+
+        /* 保留旧代码, 只更新成功获取的数据 */
         strlcpy(f->code, s_fund_codes[i], sizeof(f->code));
 
+        /* 尝试 fundgz 实时估值 */
         char url[128];
         snprintf(url, sizeof(url), "http://fundgz.1234567.com.cn/js/%s.js", s_fund_codes[i]);
         char *resp = http_get(url);
@@ -274,7 +256,7 @@ esp_err_t api_fetch_funds(FundItem_t *funds, int *count)
                         cJSON_Delete(root);
                         free(resp);
                         ESP_LOGI(TAG, "Fund %s: %.4f", f->code, f->nav);
-                        (*count)++;
+                        got++;
                         continue;
                     }
                 }
@@ -282,7 +264,7 @@ esp_err_t api_fetch_funds(FundItem_t *funds, int *count)
             free(resp);
         }
 
-        /* Fallback to bridge */
+        /* Fallback to bridge (保留旧数据不覆盖) */
         char bhost[64] = {0}, bport[8] = "80";
         const char *s = strstr(BRIDGE_URL, "://");
         if (!s) continue;
@@ -291,21 +273,20 @@ esp_err_t api_fetch_funds(FundItem_t *funds, int *count)
         if (*s == ':') { s++; bi = 0; while (*s && *s != '/' && bi < 6) bport[bi++] = *s++; bport[bi] = '\0'; }
         char burl[256];
         snprintf(burl, sizeof(burl), "http://%s:%s/api/fund/%s", bhost, bport, s_fund_codes[i]);
-        ESP_LOGI(TAG, "Bridge fallback: %s", burl);
         char *bp = http_get(burl);
         if (bp) {
-            ESP_LOGI(TAG, "Bridge resp: %.60s", bp);
             cJSON *br = cJSON_Parse(bp); free(bp);
             if (br) {
                 cJSON *item = cJSON_GetObjectItem(br, "nav");
-                if (item) { f->nav = (float)item->valuedouble; (*count)++; }
-                else { ESP_LOGW(TAG, "Bridge: no nav field"); }
+                if (item) { f->nav = (float)item->valuedouble; got++; }
                 cJSON_Delete(br);
-            } else { ESP_LOGW(TAG, "Bridge: JSON parse fail"); }
-        } else { ESP_LOGW(TAG, "Bridge: http_get NULL"); }
+            }
+        } else {
+            ESP_LOGW(TAG, "Fund %s: no data (keeping old nav=%.4f)", f->code, f->nav);
+        }
     }
     *count = s_fund_count;
-    return (*count > 0) ? ESP_OK : ESP_FAIL;
+    return (got > 0) ? ESP_OK : ESP_FAIL;
 }
 
 /* ===== DeepSeek via bridge ===== */

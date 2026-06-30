@@ -89,8 +89,9 @@ typedef struct {
 
     /* 电池 */
     int battery_pct;         /* 0~100 */
-
-    /* 刷新时间 */
+    int bat_drop_per_h;      /* 每小时下降% */
+    int bat_est_hours;       /* 预估续航小时 */
+    int bat_log_count;       /* 历史记录条数 */
     char last_update[10];    /* HH:MM */
 } AppData_t;
 

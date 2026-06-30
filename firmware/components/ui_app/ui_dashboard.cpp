@@ -169,7 +169,6 @@ void dashboard_update(const AppData_t *app)
                  fd.tm_mon+1, fd.tm_mday,
                  app->weather.fc_cond[i],
                  app->weather.fc_min[i], app->weather.fc_max[i]);
-        ESP_LOGI(TAG, "FC show[%d]: '%s'", i, b);
         lv_label_set_text(l_fc[i], b);
     }
 
@@ -193,8 +192,13 @@ void dashboard_update(const AppData_t *app)
                  (double)r_used / (1024*1024), (double)r_total / (1024*1024));
         lv_label_set_text(l_d2, b);
 
-        size_t psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-        snprintf(b, sizeof b, "PSRAM: %.1fM", (double)psram / (1024*1024));
+        /* 电量趋势 (替代PSRAM行) */
+        if (app->bat_drop_per_h > 0) {
+            snprintf(b, sizeof b, "电量:%d%%  -%d%%/h  ~%dh",
+                     app->battery_pct, app->bat_drop_per_h, app->bat_est_hours);
+        } else {
+            snprintf(b, sizeof b, "电量:%d%%  (记录中)", app->battery_pct);
+        }
         lv_label_set_text(l_d3, b);
 
         uint32_t ms = xTaskGetTickCount() * portTICK_PERIOD_MS;

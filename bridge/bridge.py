@@ -15,6 +15,7 @@ import sys
 import json
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -35,21 +36,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bridge")
 
-app = FastAPI(title="RLCD Monitor Bridge")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # 缓存
-_cache = {
-    "data": {},
-    "updated_at": None,
-}
+_cache = {"data": {}, "updated_at": None}
 _lock = asyncio.Lock()
 _POLL_SEC = int(os.getenv("RLCD_POLL_SEC", "60"))
 
@@ -81,11 +69,31 @@ async def _refresh_cache():
         await asyncio.sleep(_POLL_SEC)
 
 
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(_refresh_cache())
-    logger.info("Bridge started")
-    logger.info(f"Poll interval: {_POLL_SEC}s")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启动/关闭生命周期"""
+    # 启动
+    bg_task = asyncio.create_task(_refresh_cache())
+    if DEEPSEEK_API_KEY:
+        logger.info("DeepSeek API key configured ✓")
+    else:
+        logger.info("DeepSeek API key not set, using mock data")
+    logger.info(f"Bridge started, poll interval: {_POLL_SEC}s")
+    yield
+    # 关闭
+    bg_task.cancel()
+    logger.info("Bridge stopped")
+
+
+app = FastAPI(title="RLCD Monitor Bridge", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/api/usage", response_model=UsageResponse)
@@ -137,6 +145,38 @@ async def get_fund(code: str):
 @app.get("/health")
 async def health():
     return {"status": "ok", "updated_at": _cache.get("updated_at")}
+
+
+# ===== 电池电量日志 (ESP32 定期上报) =====
+_bat_log = []  # [{ts, pct}, ...]
+
+@app.post("/api/battery/upload")
+async def battery_upload(data: dict):
+    """ESP32 上报电池数据"""
+    _bat_log.append({"ts": data.get("ts"), "pct": data.get("pct")})
+    # 只保留最近 24 小时
+    cutoff = datetime.now().timestamp() - 86400
+    _bat_log[:] = [r for r in _bat_log if r["ts"] and r["ts"] > cutoff]
+    return {"ok": True, "count": len(_bat_log)}
+
+@app.get("/api/battery")
+async def battery_get():
+    """获取电池历史数据"""
+    latest = _bat_log[-1] if _bat_log else {"pct": 0, "ts": 0}
+    drop = 0
+    if len(_bat_log) >= 2:
+        first = _bat_log[0]
+        elapsed_h = (latest["ts"] - first["ts"]) / 3600 if latest["ts"] > first["ts"] else 0
+        if elapsed_h > 0.1:
+            drop = (first["pct"] - latest["pct"]) / elapsed_h
+    return {
+        "records": _bat_log[-288:],  # 最多返回最近 24h
+        "summary": {
+            "current": latest["pct"],
+            "drop_per_h": round(drop, 1),
+            "total_records": len(_bat_log),
+        }
+    }
 
 
 def main():

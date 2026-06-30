@@ -64,31 +64,14 @@ static lv_obj_t *ui_weather_text;
 static lv_obj_t *ui_weather_indoor;
 static lv_obj_t *ui_gold_text;
 static lv_obj_t *ui_gold_change;
-static lv_obj_t *ui_asset_value;
-static lv_obj_t *ui_asset_change;
-static lv_obj_t *ui_stat_text;
 static lv_obj_t *fund_labels[MAX_FUNDS][3]; /* [i][0]=name, [1]=nav, [2]=chg */
 /* 走势柱条已移除 */
 static int       fund_count = 0;
 static const char *fund_names[MAX_FUNDS] = {"摩根日本精选股票(QDII)A","摩根纳斯达克100指数(QDII)","广发全球精选股票(QDII)"};
 static lv_obj_t *ui_ds_balance;
 static lv_obj_t *ui_ds_cache;
-static lv_obj_t *ui_ds_today;
 static lv_obj_t *ds_line2_v1, *ds_line2_v2;
 /* footer removed */
-
-/* ===== 创建文字标签辅助 ===== */
-static lv_obj_t *make_label(lv_obj_t *parent, const char *text,
-                            lv_align_t align, lv_coord_t x, lv_coord_t y,
-                            int size, bool bold)
-{
-    lv_obj_t *lbl = lv_label_create(parent);
-    lv_obj_set_style_text_color(lbl, C_BLACK, 0);
-    lv_label_set_text(lbl, text);
-    lv_obj_align(lbl, align, x, y);
-    if (bold) lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
-    return lbl;
-}
 
 /* ===== 状态栏 ===== */
 static void create_status_bar(lv_obj_t *parent)

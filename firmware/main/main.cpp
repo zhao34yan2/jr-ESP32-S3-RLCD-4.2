@@ -15,6 +15,7 @@
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <nvs_flash.h>
+#include <nvs.h>
 #include <esp_wifi.h>
 
 #include <esp_adc/adc_oneshot.h>
@@ -52,10 +53,135 @@ static int read_battery_pct(void)
     int raw = 0;
     adc_oneshot_read(s_adc_handle, ADC_CHANNEL_3, &raw);
     /* 3倍分压: 满电4.2V→ADC≈1737, 空电3.3V→ADC≈1364 */
-    int pct = (raw - 1100) * 100 / (1650 - 1100);
+    int pct = (raw - 1200) * 100 / (1639 - 1200);
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
     return pct;
+}
+
+/* ===== 电池电量日志 (NVS) ===== */
+#define BAT_LOG_INTERVAL_MS  600000   /* 每10分钟记一条 */
+#define BAT_LOG_MAX          432      /* 保留3天 */
+#define BAT_LOG_KEY          "bat_log"
+
+/* 日志格式: 4字节时间戳 + 1字节电量% */
+typedef struct {
+    uint32_t ts;     /* unix 时间戳 */
+    uint8_t  pct;    /* 0~100 */
+} __attribute__((packed)) BatRec_t;
+
+static nvs_handle_t s_bat_nvs = 0;
+static int32_t s_bat_log_count = 0;
+static int s_bat_first_pct = -1; /* 最早记录的电量 */
+static uint32_t s_bat_first_ts = 0;
+
+static void battery_log_init(void)
+{
+    esp_err_t err = nvs_open("battery", NVS_READWRITE, &s_bat_nvs);
+    if (err != ESP_OK) {
+        ESP_LOGW("BAT", "NVS open fail: %d", err);
+        return;
+    }
+    /* 读取已有记录数 */
+    size_t sz = sizeof(s_bat_log_count);
+    nvs_get_i32(s_bat_nvs, "count", &s_bat_log_count);
+    if (s_bat_log_count > BAT_LOG_MAX) s_bat_log_count = BAT_LOG_MAX;
+    /* 读取第一条数据用于趋势计算 */
+    BatRec_t first = {};
+    sz = sizeof(BatRec_t);
+    if (nvs_get_blob(s_bat_nvs, "rec0", &first, &sz) == ESP_OK && first.ts > 0) {
+        s_bat_first_pct = first.pct;
+        s_bat_first_ts = first.ts;
+    }
+    ESP_LOGI("BAT", "Log init: %d records", s_bat_log_count);
+}
+
+static void battery_log_save(int pct)
+{
+    if (!s_bat_nvs) return;
+
+    time_t now;
+    time(&now);
+    if (now < 100000) return; /* NTP未同步, 时间不可靠 */
+
+    /* 读取最后一条记录的时间, 判断是否够10分钟 */
+    BatRec_t last = {};
+    size_t sz = sizeof(BatRec_t);
+    int idx = (int)((s_bat_log_count > 0) ? s_bat_log_count - 1 : 0);
+    char key[16];
+    snprintf(key, sizeof(key), "rec%d", idx);
+    if (nvs_get_blob(s_bat_nvs, key, &last, &sz) == ESP_OK && last.ts > 0) {
+        if (now - last.ts < BAT_LOG_INTERVAL_MS / 1000) return; /* 间隔未到 */
+    }
+
+    /* 环形写入 */
+    int write_idx = (int)s_bat_log_count;
+    if (write_idx >= BAT_LOG_MAX) {
+        /* 满了, 覆盖最早一条, 整体前移 */
+        for (int i = 1; i < BAT_LOG_MAX; i++) {
+            char k_old[16], k_new[16];
+            snprintf(k_old, sizeof(k_old), "rec%d", i);
+            snprintf(k_new, sizeof(k_new), "rec%d", i - 1);
+            BatRec_t tmp = {};
+            size_t tsz = sizeof(BatRec_t);
+            if (nvs_get_blob(s_bat_nvs, k_old, &tmp, &tsz) == ESP_OK) {
+                nvs_set_blob(s_bat_nvs, k_new, &tmp, sizeof(BatRec_t));
+            }
+        }
+        write_idx = BAT_LOG_MAX - 1;
+        s_bat_log_count = BAT_LOG_MAX;
+    } else {
+        s_bat_log_count++;
+    }
+
+    BatRec_t rec;
+    rec.ts = (uint32_t)now;
+    rec.pct = (uint8_t)pct;
+    snprintf(key, sizeof(key), "rec%d", write_idx);
+    nvs_set_blob(s_bat_nvs, key, &rec, sizeof(BatRec_t));
+    nvs_set_i32(s_bat_nvs, "count", (int32_t)s_bat_log_count);
+    nvs_commit(s_bat_nvs);
+
+    /* 更新趋势数据 */
+    if (s_bat_first_pct < 0) {
+        s_bat_first_pct = pct;
+        s_bat_first_ts = rec.ts;
+    }
+}
+
+static void battery_calc_trend(AppData_t *app)
+{
+    if (s_bat_log_count < 2 || s_bat_first_ts == 0) {
+        app->bat_drop_per_h = 0;
+        app->bat_est_hours = 0;
+        app->bat_log_count = (int)s_bat_log_count;
+        return;
+    }
+
+    BatRec_t last = {};
+    size_t sz = sizeof(BatRec_t);
+    char key[16];
+    snprintf(key, sizeof(key), "rec%d", (int)(s_bat_log_count - 1));
+    if (nvs_get_blob(s_bat_nvs, key, &last, &sz) != ESP_OK) {
+        app->bat_drop_per_h = 0;
+        return;
+    }
+
+    float elapsed_h = (float)(last.ts - s_bat_first_ts) / 3600.0f;
+    if (elapsed_h < 0.1f) { app->bat_drop_per_h = 0; return; }
+
+    int dropped = s_bat_first_pct - (int)last.pct;
+    if (dropped < 0) dropped = 0; /* 充电时不计 */
+
+    int per_h = (int)((float)dropped / elapsed_h + 0.5f);
+    if (per_h < 1) per_h = 0;
+
+    app->bat_drop_per_h = per_h;
+    app->bat_est_hours = (per_h > 0) ? (last.pct / per_h) : 999;
+    app->bat_log_count = (int)s_bat_log_count;
+
+    ESP_LOGD("BAT", "Trend: %d records, dropped %d%% in %.1fh = %d%%/h, est %dh",
+             s_bat_log_count, dropped, elapsed_h, per_h, app->bat_est_hours);
 }
 
 /* ===== LVGL 刷新回调 ===== */
@@ -74,7 +200,7 @@ static void lvgl_flush_cb(lv_display_t *drv, const lv_area_t *area, uint8_t *col
 }
 
 /* ===== 全局数据缓存 ===== */
-static AppData_t g_app_data = {0};
+static AppData_t g_app_data = {};
 
 /* ===== 传感器读取任务 ===== */
 static void sensor_task(void *pv)
@@ -167,22 +293,22 @@ static void ui_task(void *pv)
     while (1) {
         /* KEY检测 (在锁外也可以读GPIO) */
         bool key = (gpio_get_level(KEY_GPIO) == 0);
+        TickType_t now = xTaskGetTickCount();
 
         /* 电池电量每分钟读取一次 (ADC 频繁读取增加功耗) */
-        TickType_t now = xTaskGetTickCount();
         if (now - s_last_bat >= pdMS_TO_TICKS(60000)) {
             s_last_bat = now;
             g_app_data.battery_pct = read_battery_pct();
+            battery_log_save(g_app_data.battery_pct);
+            battery_calc_trend(&g_app_data);
         }
 
         if (Lvgl_lock(100)) {
-            /* KEY按下检测 (下降沿) */
+            /* KEY按下检测 (下降沿) — 手动切换页面 */
             if (key && !g_key_last) {
                 g_page = !g_page;
-                if (g_page == 0)
-                    lv_scr_load(main_screen);
-                else
-                    lv_scr_load(dashboard_get_screen());
+                lv_scr_load_anim(g_page == 0 ? main_screen : dashboard_get_screen(),
+                                  LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
                 ESP_LOGI(TAG, "Switch to page %d", g_page);
             }
             g_key_last = key;
@@ -254,6 +380,9 @@ extern "C" void app_main(void)
     xTaskCreatePinnedToCore(sensor_task, "sensor", 4096, NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(api_task,    "api",    8192, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(ui_task,     "ui",     5120, NULL, 6, NULL, 0);
+
+    /* 8. 初始化电池日志 */
+    battery_log_init();
 
     ESP_LOGI(TAG, "=== All systems running ===");
 }
