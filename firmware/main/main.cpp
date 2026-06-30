@@ -153,7 +153,7 @@ static void battery_calc_trend(AppData_t *app)
 {
     if (s_bat_log_count < 2 || s_bat_first_ts == 0) {
         app->bat_drop_per_h = 0;
-        app->bat_est_hours = 0;
+        app->bat_est_hours = 999;
         app->bat_log_count = (int)s_bat_log_count;
         return;
     }

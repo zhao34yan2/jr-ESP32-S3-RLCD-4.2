@@ -8,5 +8,6 @@ bridge/__pycache__/
 scripts/node_modules/
 scripts/cf*.c
 scripts/custom_font_*.c
+scripts/node.exe
 *.bin
 *.log

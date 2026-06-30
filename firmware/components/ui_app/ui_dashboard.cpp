@@ -120,7 +120,7 @@ void dashboard_create(void)
         lv_obj_t *c = card(scr, "设备", X2, Y2, CW, CH);
         l_d1 = mk(c, "---", 4, 22, &lv_font_montserrat_12);
         l_d2 = mk(c, "---", 4, 44, &lv_font_montserrat_12);
-        l_d3 = mk(c, "---", 4, 66, &lv_font_montserrat_12);
+        l_d3 = mk(c, "---", 4, 66, FONT_CN);
         l_d4 = mk(c, "---", 4, 88, &lv_font_montserrat_12);
     }
 
@@ -193,12 +193,8 @@ void dashboard_update(const AppData_t *app)
         lv_label_set_text(l_d2, b);
 
         /* 电量趋势 (替代PSRAM行) */
-        if (app->bat_drop_per_h > 0) {
-            snprintf(b, sizeof b, "电量:%d%%  -%d%%/h  ~%dh",
-                     app->battery_pct, app->bat_drop_per_h, app->bat_est_hours);
-        } else {
-            snprintf(b, sizeof b, "电量:%d%%  (记录中)", app->battery_pct);
-        }
+        snprintf(b, sizeof b, "电耗:%d%%/h %dh",
+                 app->bat_drop_per_h, app->bat_est_hours);
         lv_label_set_text(l_d3, b);
 
         uint32_t ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
