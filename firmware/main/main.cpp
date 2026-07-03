@@ -367,6 +367,12 @@ static void ui_task(void *pv)
 /* ===== Bridge UDP 自动发现 ===== */
 static void bridge_discovery_task(void *pv)
 {
+    /* 等待 WiFi 连接 (最多30秒) */
+    for (int i = 0; i < 30; i++) {
+        if (wifi_is_connected()) break;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) { ESP_LOGE(TAG, "Discovery socket fail"); return; }
 
@@ -376,18 +382,24 @@ static void bridge_discovery_task(void *pv)
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     bind(sock, (struct sockaddr *)&addr, sizeof(addr));
 
-    struct timeval tv = {2, 0};
+    struct timeval tv = {3, 0};
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     ESP_LOGI(TAG, "Bridge discovery listening on UDP:7777...");
+    char last_url[128] = "";
     while (1) {
         char buf[256] = {};
         int n = recv(sock, buf, sizeof(buf) - 1, 0);
         if (n > 18 && memcmp(buf, "RLCD_BRIDGE ", 12) == 0) {
             char *url = buf + 12;
+            while (n > 12 && (url[n-13] == '\n' || url[n-13] == '\r')) url[--n - 12] = '\0';
             url[n - 12] = '\0';
-            ESP_LOGI(TAG, "Discovery: %s", url);
-            set_bridge_url(url);
+            /* 仅当 URL 变化时才写 NVS (防 Flash 磨损) */
+            if (strcmp(url, last_url) != 0) {
+                strlcpy(last_url, url, sizeof(last_url));
+                ESP_LOGI(TAG, "Discovery: %s", url);
+                set_bridge_url(url);
+            }
         }
     }
     close(sock);

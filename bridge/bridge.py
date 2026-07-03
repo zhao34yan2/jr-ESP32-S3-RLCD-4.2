@@ -72,29 +72,41 @@ async def _refresh_cache():
         await asyncio.sleep(_POLL_SEC)
 
 
-def _udp_broadcast():
-    """UDP 广播：让 ESP32 自动发现 Bridge 地址"""
-    host = os.getenv("RLCD_HOST", "0.0.0.0")
-    port = int(os.getenv("RLCD_PORT", "7777"))
-    # 获取本机实际 IP
-    local_ip = "127.0.0.1"
+def _get_local_ip():
+    """获取本机局域网 IP (不依赖外网连接)"""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
+        return socket.gethostbyname(socket.gethostname())
     except:
         pass
+    # 回退: 枚举所有接口
+    try:
+        import subprocess
+        out = subprocess.check_output("ipconfig", shell=True, text=True)
+        for line in out.splitlines():
+            if "IPv4" in line and ":" in line:
+                ip = line.split(":")[-1].strip()
+                if ip.startswith("10.") or ip.startswith("192.168."):
+                    return ip
+    except:
+        pass
+    return "127.0.0.1"
 
+
+def _udp_broadcast():
+    """UDP 广播：让 ESP32 自动发现 Bridge 地址 (每5秒)"""
+    port = int(os.getenv("RLCD_PORT", "7777"))
+    local_ip = _get_local_ip()
     msg = f"RLCD_BRIDGE http://{local_ip}:{port}/api/usage"
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    logger.info(f"UDP broadcast: {msg} (every 5s)")
     while True:
         try:
             sock.sendto(msg.encode(), ("255.255.255.255", 7777))
-            threading.Event().wait(5)  # 每5秒广播一次
-        except:
-            threading.Event().wait(5)
+        except Exception as e:
+            logger.warning(f"UDP broadcast error: {e}")
+        threading.Event().wait(5)
 
 
 @asynccontextmanager
