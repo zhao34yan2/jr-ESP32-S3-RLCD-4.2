@@ -11,6 +11,8 @@
 #include <netdb.h>
 #include <esp_log.h>
 #include <esp_http_client.h>
+#include <nvs_flash.h>
+#include <nvs.h>
 #include <cJSON.h>
 #include "api_clients.h"
 #include "secrets.h"
@@ -266,7 +268,7 @@ esp_err_t api_fetch_funds(FundItem_t *funds, int *count)
 
         /* Fallback to bridge (保留旧数据不覆盖) */
         char bhost[64] = {0}, bport[8] = "80";
-        const char *s = strstr(BRIDGE_URL, "://");
+        const char *s = strstr(get_bridge_url(), "://");
         if (!s) continue;
         s += 3; int bi = 0;
         while (*s && *s != '/' && *s != ':' && bi < 63) bhost[bi++] = *s++;
@@ -289,10 +291,43 @@ esp_err_t api_fetch_funds(FundItem_t *funds, int *count)
     return (got > 0) ? ESP_OK : ESP_FAIL;
 }
 
+/* ===== Bridge URL 管理 (NVS 持久化, 免重新编译) ===== */
+static char s_bridge_url[128] = "";
+
+const char *get_bridge_url(void)
+{
+    if (s_bridge_url[0] == '\0') {
+        nvs_handle_t nvs;
+        esp_err_t err = nvs_open("bridge", NVS_READONLY, &nvs);
+        if (err == ESP_OK) {
+            size_t sz = sizeof(s_bridge_url);
+            if (nvs_get_str(nvs, "url", s_bridge_url, &sz) != ESP_OK) {
+                strlcpy(s_bridge_url, BRIDGE_URL, sizeof(s_bridge_url));
+            }
+            nvs_close(nvs);
+        } else {
+            strlcpy(s_bridge_url, BRIDGE_URL, sizeof(s_bridge_url));
+        }
+    }
+    return s_bridge_url;
+}
+
+void set_bridge_url(const char *url)
+{
+    nvs_handle_t nvs;
+    if (nvs_open("bridge", NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_str(nvs, "url", url);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        strlcpy(s_bridge_url, url, sizeof(s_bridge_url));
+        ESP_LOGI(TAG, "Bridge URL updated: %s", url);
+    }
+}
+
 /* ===== DeepSeek via bridge ===== */
 esp_err_t api_fetch_deepseek(DeepSeekData_t *out)
 {
-    char *resp = http_get(BRIDGE_URL);
+    char *resp = http_get(get_bridge_url());
     if (!resp) return ESP_FAIL;
     cJSON *root = cJSON_Parse(resp); free(resp);
     if (!root) return ESP_FAIL;

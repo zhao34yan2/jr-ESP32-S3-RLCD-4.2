@@ -132,6 +132,16 @@ void api_calc_summary(AppData_t *app);
  */
 void api_set_fund_codes(const char *codes[], int count);
 
+/**
+ * @brief 获取 Bridge URL (NVS > 编译默认)
+ */
+const char *get_bridge_url(void);
+
+/**
+ * @brief 设置 Bridge URL (写入 NVS, 永久生效)
+ */
+void set_bridge_url(const char *url);
+
 #ifdef __cplusplus
 }
 #endif

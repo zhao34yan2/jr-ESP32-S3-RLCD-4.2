@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
+#include <sys/select.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
@@ -364,6 +365,9 @@ extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "=== RLCD Monitor Starting ===");
 
+    /* 显示 Bridge URL 来源 */
+    ESP_LOGI(TAG, "Bridge URL: %s", get_bridge_url());
+
     /* 1. 初始化 NVS */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -421,4 +425,5 @@ extern "C" void app_main(void)
     battery_log_init();
 
     ESP_LOGI(TAG, "=== All systems running ===");
+    ESP_LOGI(TAG, "Type 'bridge://IP:PORT' to change Bridge URL");
 }
