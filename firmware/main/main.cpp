@@ -72,8 +72,8 @@ typedef struct {
 
 static nvs_handle_t s_bat_nvs = 0;
 static int32_t s_bat_log_count = 0;
-static int s_bat_first_pct = -1; /* 最早记录的电量 */
-static uint32_t s_bat_first_ts = 0;
+static int32_t s_bat_peak_pct = -1;  /* 最高电量 (充满基准) */
+static uint32_t s_bat_peak_ts = 0;
 
 static void battery_log_init(void)
 {
@@ -87,13 +87,25 @@ static void battery_log_init(void)
     nvs_get_i32(s_bat_nvs, "count", &s_bat_log_count);
     if (s_bat_log_count > BAT_LOG_MAX) s_bat_log_count = BAT_LOG_MAX;
     /* 读取第一条数据用于趋势计算 */
-    BatRec_t first = {};
-    sz = sizeof(BatRec_t);
-    if (nvs_get_blob(s_bat_nvs, "rec0", &first, &sz) == ESP_OK && first.ts > 0) {
-        s_bat_first_pct = first.pct;
-        s_bat_first_ts = first.ts;
+    /* 读最高记录作为放电基准 */
+    nvs_get_i32(s_bat_nvs, "peak", &s_bat_peak_pct);
+    nvs_get_i32(s_bat_nvs, "peak_ts", (int32_t *)&s_bat_peak_ts);
+    ESP_LOGI("BAT", "Log init: %d records, peak=%d%%", s_bat_log_count, s_bat_peak_pct);
+
+    /* 导出日志用于分析 */
+    if (s_bat_log_count > 0) {
+        ESP_LOGI("BAT", "=== Battery Log Dump (ts, pct) ===");
+        for (int i = 0; i < s_bat_log_count; i++) {
+            char k[16];
+            snprintf(k, sizeof(k), "rec%d", i);
+            BatRec_t r = {};
+            size_t rs = sizeof(BatRec_t);
+            if (nvs_get_blob(s_bat_nvs, k, &r, &rs) == ESP_OK && r.ts > 0) {
+                ESP_LOGI("BAT", "%d,%d", r.ts, r.pct);
+            }
+        }
+        ESP_LOGI("BAT", "=== End ===");
     }
-    ESP_LOGI("BAT", "Log init: %d records", s_bat_log_count);
 }
 
 static void battery_log_save(int pct)
@@ -140,48 +152,70 @@ static void battery_log_save(int pct)
     snprintf(key, sizeof(key), "rec%d", write_idx);
     nvs_set_blob(s_bat_nvs, key, &rec, sizeof(BatRec_t));
     nvs_set_i32(s_bat_nvs, "count", (int32_t)s_bat_log_count);
-    nvs_commit(s_bat_nvs);
 
-    /* 更新趋势数据 */
-    if (s_bat_first_pct < 0) {
-        s_bat_first_pct = pct;
-        s_bat_first_ts = rec.ts;
+    /* 更新峰值: 仅当明显上升(>=3%)才视为充电, 忽略ADC波动 */
+    if (s_bat_peak_pct < 0 || pct > s_bat_peak_pct + 3) {
+        s_bat_peak_pct = pct;
+        s_bat_peak_ts = rec.ts;
+        nvs_set_i32(s_bat_nvs, "peak", (int32_t)s_bat_peak_pct);
+        nvs_set_i32(s_bat_nvs, "peak_ts", (int32_t)s_bat_peak_ts);
+        ESP_LOGI("BAT", "Peak updated: %d%%", pct);
     }
+
+    nvs_commit(s_bat_nvs);
 }
 
 static void battery_calc_trend(AppData_t *app)
 {
-    if (s_bat_log_count < 2 || s_bat_first_ts == 0) {
-        app->bat_drop_per_h = 0;
-        app->bat_est_hours = 999;
-        app->bat_log_count = (int)s_bat_log_count;
-        return;
-    }
-
-    BatRec_t last = {};
-    size_t sz = sizeof(BatRec_t);
-    char key[16];
-    snprintf(key, sizeof(key), "rec%d", (int)(s_bat_log_count - 1));
-    if (nvs_get_blob(s_bat_nvs, key, &last, &sz) != ESP_OK) {
-        app->bat_drop_per_h = 0;
-        return;
-    }
-
-    float elapsed_h = (float)(last.ts - s_bat_first_ts) / 3600.0f;
-    if (elapsed_h < 0.1f) { app->bat_drop_per_h = 0; return; }
-
-    int dropped = s_bat_first_pct - (int)last.pct;
-    if (dropped < 0) dropped = 0; /* 充电时不计 */
-
-    int per_h = (int)((float)dropped / elapsed_h + 0.5f);
-    if (per_h < 1) per_h = 0;
-
-    app->bat_drop_per_h = per_h;
-    app->bat_est_hours = (per_h > 0) ? (last.pct / per_h) : 999;
     app->bat_log_count = (int)s_bat_log_count;
 
-    ESP_LOGD("BAT", "Trend: %d records, dropped %d%% in %.1fh = %d%%/h, est %dh",
-             s_bat_log_count, dropped, elapsed_h, per_h, app->bat_est_hours);
+    if (s_bat_nvs && s_bat_peak_pct < 0 && s_bat_log_count > 0) {
+        /* 从最后一条记录恢复峰值 (兼容旧NVS) */
+        BatRec_t last = {};
+        size_t sz = sizeof(BatRec_t);
+        char key[16];
+        snprintf(key, sizeof(key), "rec%d", (int)(s_bat_log_count - 1));
+        if (nvs_get_blob(s_bat_nvs, key, &last, &sz) == ESP_OK && last.ts > 0) {
+            s_bat_peak_pct = last.pct;
+            s_bat_peak_ts = last.ts;
+            nvs_set_i32(s_bat_nvs, "peak", (int32_t)s_bat_peak_pct);
+            nvs_set_i32(s_bat_nvs, "peak_ts", (int32_t)s_bat_peak_ts);
+            nvs_commit(s_bat_nvs);
+            ESP_LOGI("BAT", "Peak recovered: %d%%", s_bat_peak_pct);
+        }
+    }
+
+    if (s_bat_log_count < 2 || s_bat_peak_ts == 0) {
+        app->bat_drop_per_h = 0;
+        app->bat_est_hours = 999;
+        return;
+    }
+
+    /* 用峰值对比当前 */
+    uint32_t now = (uint32_t)time(NULL);
+    int dropped = s_bat_peak_pct - app->battery_pct;
+
+    if (dropped <= 0) {
+        /* 电池等于或高于峰值: 充电中 */
+        app->bat_drop_per_h = -1;
+        app->bat_est_hours = 999;
+        return;
+    }
+
+    float elapsed_h = (float)(now - s_bat_peak_ts) / 3600.0f;
+    if (elapsed_h < 0.1f) { /* 刚拔USB不到6分钟, 数据太少 */
+        app->bat_drop_per_h = -1;
+        return;
+    }
+
+    int per_h = (int)((float)dropped / elapsed_h + 0.5f);
+    if (per_h < 1) per_h = 1;
+
+    app->bat_drop_per_h = per_h;
+    app->bat_est_hours = app->battery_pct / per_h;
+
+    ESP_LOGI("BAT", "Trend: peak=%d%%, now=%d%%, drop=%d%% in %.1fh = %d%%/h",
+             s_bat_peak_pct, app->battery_pct, dropped, elapsed_h, per_h);
 }
 
 /* ===== LVGL 刷新回调 ===== */
@@ -353,11 +387,13 @@ extern "C" void app_main(void)
     }
 
     /* 初始化KEY (GPIO0) */
-    gpio_config_t io_conf = {0};
+    gpio_config_t io_conf;
+    memset(&io_conf, 0, sizeof(io_conf));
     io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pin_bit_mask = (1ULL << KEY_GPIO);
     io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     gpio_config(&io_conf);
     g_key_last = gpio_get_level(KEY_GPIO);
 

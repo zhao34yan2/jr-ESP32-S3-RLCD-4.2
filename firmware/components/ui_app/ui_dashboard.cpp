@@ -193,8 +193,16 @@ void dashboard_update(const AppData_t *app)
         lv_label_set_text(l_d2, b);
 
         /* 电量趋势 (替代PSRAM行) */
-        snprintf(b, sizeof b, "电耗:%d%%/h %dh",
-                 app->bat_drop_per_h, app->bat_est_hours);
+        if (app->bat_log_count < 2) {
+            snprintf(b, sizeof b, "电耗:记录中..");
+        } else if (app->bat_drop_per_h > 0) {
+            snprintf(b, sizeof b, "电耗:%d%%/h %dh",
+                     app->bat_drop_per_h, app->bat_est_hours);
+        } else if (app->bat_drop_per_h < 0) {
+            snprintf(b, sizeof b, "Charging..");
+        } else {
+            snprintf(b, sizeof b, "电耗:%d%%/h", 1);
+        }
         lv_label_set_text(l_d3, b);
 
         uint32_t ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
