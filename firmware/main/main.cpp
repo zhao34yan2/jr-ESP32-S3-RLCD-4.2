@@ -11,6 +11,9 @@
 #include <cstdlib>
 #include <ctime>
 #include <sys/select.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
@@ -361,6 +364,35 @@ static void ui_task(void *pv)
 }
 
 /* ===== 主入口 ===== */
+/* ===== Bridge UDP 自动发现 ===== */
+static void bridge_discovery_task(void *pv)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) { ESP_LOGE(TAG, "Discovery socket fail"); return; }
+
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(7777);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind(sock, (struct sockaddr *)&addr, sizeof(addr));
+
+    struct timeval tv = {2, 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    ESP_LOGI(TAG, "Bridge discovery listening on UDP:7777...");
+    while (1) {
+        char buf[256] = {};
+        int n = recv(sock, buf, sizeof(buf) - 1, 0);
+        if (n > 18 && memcmp(buf, "RLCD_BRIDGE ", 12) == 0) {
+            char *url = buf + 12;
+            url[n - 12] = '\0';
+            ESP_LOGI(TAG, "Discovery: %s", url);
+            set_bridge_url(url);
+        }
+    }
+    close(sock);
+}
+
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "=== RLCD Monitor Starting ===");
@@ -420,6 +452,7 @@ extern "C" void app_main(void)
     xTaskCreatePinnedToCore(sensor_task, "sensor", 4096, NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(api_task,    "api",    8192, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(ui_task,     "ui",     5120, NULL, 6, NULL, 0);
+    xTaskCreatePinnedToCore(bridge_discovery_task, "discovery", 4096, NULL, 1, NULL, 1);
 
     /* 8. 初始化电池日志 */
     battery_log_init();

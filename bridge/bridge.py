@@ -13,8 +13,11 @@ RLCD Monitor Bridge — 守护进程
 import os
 import sys
 import json
+import socket
+import struct
 import asyncio
 import logging
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -69,11 +72,38 @@ async def _refresh_cache():
         await asyncio.sleep(_POLL_SEC)
 
 
+def _udp_broadcast():
+    """UDP 广播：让 ESP32 自动发现 Bridge 地址"""
+    host = os.getenv("RLCD_HOST", "0.0.0.0")
+    port = int(os.getenv("RLCD_PORT", "7777"))
+    # 获取本机实际 IP
+    local_ip = "127.0.0.1"
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except:
+        pass
+
+    msg = f"RLCD_BRIDGE http://{local_ip}:{port}/api/usage"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    while True:
+        try:
+            sock.sendto(msg.encode(), ("255.255.255.255", 7777))
+            threading.Event().wait(5)  # 每5秒广播一次
+        except:
+            threading.Event().wait(5)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """启动/关闭生命周期"""
     # 启动
     bg_task = asyncio.create_task(_refresh_cache())
+    udp_thread = threading.Thread(target=_udp_broadcast, daemon=True)
+    udp_thread.start()
     if DEEPSEEK_API_KEY:
         logger.info("DeepSeek API key configured ✓")
     else:
