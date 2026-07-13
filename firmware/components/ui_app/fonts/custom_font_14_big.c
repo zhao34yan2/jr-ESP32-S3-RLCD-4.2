@@ -1,16 +1,20 @@
 /*******************************************************************************
  * Size: 14 px
  * Bpp: 1
- * Opts: --font C:/Windows/Fonts/Deng.ttf -r 0x20-0x7f --symbols 积存金白银元克千克室内温度湿%RH高低月日今-+0123456789.:,天基金净值余更新交易中所周上PM晴阴雨雪雾霾多云点分秒时年项开启关闭高低温差风级存一二三四五六星期南京WiFiNO摩根本精选股票纳斯达克指数人民币广发全球总资产涨跌净额等待联网平产出▲▼◉费用成本消耗命中率token电量余额命中率cache消耗token气预报设备池小 --size 14 --bpp 1 --no-compress --no-prefilter -o custom_font_14_big.c --format lvgl
+ * Opts: --font C:/Windows/Fonts/Deng.ttf -r 0x20-0x7f --symbols 积存金白银元克千克室内温度湿%RH高低月日今-+0123456789.:,天基金净值余更新交易中所周上PM晴阴雨雪雾霾多云点分秒时年项开启关闭高低温差风级存一二三四五六星期南京WiFiNO摩根本精选股票纳斯达克指数人民币广发全球总资产涨跌净额等待联网平产出▲▼◉费用成本消耗命中率token电量余额命中率cache消耗token气预报设备池小黄 --size 14 --bpp 1 --no-compress --no-prefilter -o custom_font_14_big.c --format lvgl
  ******************************************************************************/
 
+#ifdef LV_LVGL_H_INCLUDE_SIMPLE
 #include "lvgl.h"
-
-#ifndef CF2
-#define CF2 1
+#else
+#include "lvgl.h"
 #endif
 
-#if CF2
+#ifndef CF3
+#define CF3 1
+#endif
+
+#if CF3
 
 /*-----------------
  *    BITMAPS
@@ -892,7 +896,12 @@ static LV_ATTRIBUTE_LARGE_CONST const uint8_t glyph_bitmap[] = {
     /* U+9AD8 "高" */
     0x6, 0xf, 0xff, 0x0, 0x3, 0xf8, 0x20, 0x83,
     0xf8, 0x0, 0x7, 0xfe, 0x80, 0x29, 0xfa, 0x9f,
-    0xa8, 0x2, 0x80, 0x60
+    0xa8, 0x2, 0x80, 0x60,
+
+    /* U+9EC4 "黄" */
+    0x8, 0x80, 0x88, 0x7f, 0xe0, 0x88, 0xff, 0xf0,
+    0x20, 0x3f, 0xe2, 0x22, 0x3f, 0xe3, 0xfe, 0x8,
+    0x83, 0x6, 0x40, 0x0
 };
 
 
@@ -1107,7 +1116,8 @@ static const lv_font_fmt_txt_glyph_dsc_t glyph_dsc[] = {
     {.bitmap_index = 2820, .adv_w = 224, .box_w = 13, .box_h = 12, .ofs_x = 0, .ofs_y = -2},
     {.bitmap_index = 2840, .adv_w = 224, .box_w = 13, .box_h = 14, .ofs_x = 0, .ofs_y = -3},
     {.bitmap_index = 2863, .adv_w = 224, .box_w = 14, .box_h = 12, .ofs_x = 1, .ofs_y = -2},
-    {.bitmap_index = 2884, .adv_w = 224, .box_w = 12, .box_h = 13, .ofs_x = 1, .ofs_y = -2}
+    {.bitmap_index = 2884, .adv_w = 224, .box_w = 12, .box_h = 13, .ofs_x = 1, .ofs_y = -2},
+    {.bitmap_index = 2904, .adv_w = 224, .box_w = 12, .box_h = 13, .ofs_x = 1, .ofs_y = -2}
 };
 
 /*---------------------
@@ -1128,7 +1138,7 @@ static const uint16_t unicode_list_1[] = {
     0x53b6, 0x5420, 0x543d, 0x5597, 0x570c, 0x58f5, 0x5901, 0x599f,
     0x5a65, 0x5aa2, 0x5aef, 0x660c, 0x6787, 0x6792, 0x681a, 0x6a0c,
     0x6a57, 0x6c1d, 0x6c1f, 0x6f44, 0x703b, 0x7082, 0x7136, 0x7138,
-    0x714c, 0x718c, 0x72c7, 0x72d2, 0x72eb, 0x731c, 0x7526
+    0x714c, 0x718c, 0x72c7, 0x72d2, 0x72eb, 0x731c, 0x7526, 0x7912
 };
 
 /*Collect the unicode lists and glyph_id offsets*/
@@ -1139,8 +1149,8 @@ static const lv_font_fmt_txt_cmap_t cmaps[] =
         .unicode_list = NULL, .glyph_id_ofs_list = NULL, .list_length = 0, .type = LV_FONT_FMT_TXT_CMAP_FORMAT0_TINY
     },
     {
-        .range_start = 9650, .range_length = 29991, .glyph_id_start = 96,
-        .unicode_list = unicode_list_1, .glyph_id_ofs_list = NULL, .list_length = 111, .type = LV_FONT_FMT_TXT_CMAP_SPARSE_TINY
+        .range_start = 9650, .range_length = 30995, .glyph_id_start = 96,
+        .unicode_list = unicode_list_1, .glyph_id_ofs_list = NULL, .list_length = 112, .type = LV_FONT_FMT_TXT_CMAP_SPARSE_TINY
     }
 };
 
@@ -1206,5 +1216,5 @@ lv_font_t custom_font_14_big = {
 
 
 
-#endif /*#if CF2*/
+#endif /*#if CF3*/
 

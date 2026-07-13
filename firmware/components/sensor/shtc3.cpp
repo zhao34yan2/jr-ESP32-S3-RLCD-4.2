@@ -82,8 +82,8 @@ esp_err_t shtc3_read(float *temperature, float *humidity)
 
     *humidity    = 100.0f * raw_hum / 65536.0f;
     *temperature = -45.0f + 175.0f * raw_temp / 65536.0f;
-    /* 板载 SHTC3 靠近 ESP32 芯片，减去芯片发热补偿 */
-    *temperature -= 35.0f;
+    /* 板载 SHTC3 靠近 ESP32 芯片, 减去芯片发热补偿 (~10°C) */
+    *temperature -= 10.0f;
 
 
 

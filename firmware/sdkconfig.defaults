@@ -1,3 +1,7 @@
+# HTTPS 证书验证
+CONFIG_ESP_TLS=y
+CONFIG_ESP_CRT_BUNDLE=y
+
 # ESP32-S3-RLCD-4.2 默认配置
 
 # 芯片

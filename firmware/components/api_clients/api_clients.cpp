@@ -11,6 +11,7 @@
 #include <netdb.h>
 #include <esp_log.h>
 #include <esp_http_client.h>
+#include <esp_crt_bundle.h>
 #include <nvs_flash.h>
 #include <nvs.h>
 #include <cJSON.h>
@@ -222,7 +223,37 @@ esp_err_t api_fetch_gold(GoldData_t *out)
 /* ===== Silver stub ===== */
 esp_err_t api_fetch_silver(SilverData_t *out) { return ESP_FAIL; }
 
-/* ===== Funds (fundgz + bridge fallback) ===== */
+/* ===== HTTPS GET using esp_http_client (支持自定义头) ===== */
+static char *https_get(const char *url, const char *header_key, const char *header_val)
+{
+    esp_http_client_config_t cfg = {0};
+    cfg.url = url; cfg.timeout_ms = 5000; cfg.buffer_size = 4096;
+    cfg.skip_cert_common_name_check = true;
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) return NULL;
+    if (header_key && header_val) {
+        esp_http_client_set_header(client, header_key, header_val);
+    }
+    char *buf = (char *)malloc(4096);
+    if (!buf) { esp_http_client_cleanup(client); return NULL; }
+    memset(buf, 0, 4096);
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        int len = esp_http_client_read(client, buf, 4095);
+        if (len > 0) buf[len] = '\0';
+    } else {
+        ESP_LOGW(TAG, "HTTPS fail: %s (%s)", url, esp_err_to_name(err));
+        free(buf);
+        esp_http_client_cleanup(client);
+        return NULL;
+    }
+    esp_http_client_cleanup(client);
+    return buf;
+}
+
+static void get_bridge_base(char *buf, size_t sz);
+
+/* ===== Funds (fundgz + East Money HTTPS fallback) ===== */
 esp_err_t api_fetch_funds(FundItem_t *funds, int *count)
 {
     int got = 0;
@@ -266,26 +297,22 @@ esp_err_t api_fetch_funds(FundItem_t *funds, int *count)
             free(resp);
         }
 
-        /* Fallback to bridge (保留旧数据不覆盖) */
-        char bhost[64] = {0}, bport[8] = "80";
-        const char *s = strstr(get_bridge_url(), "://");
-        if (!s) continue;
-        s += 3; int bi = 0;
-        while (*s && *s != '/' && *s != ':' && bi < 63) bhost[bi++] = *s++;
-        if (*s == ':') { s++; bi = 0; while (*s && *s != '/' && bi < 6) bport[bi++] = *s++; bport[bi] = '\0'; }
+        /* Fallback to Bridge */
+        char base[64];
+        get_bridge_base(base, sizeof(base));
         char burl[256];
-        snprintf(burl, sizeof(burl), "http://%s:%s/api/fund/%s", bhost, bport, s_fund_codes[i]);
+        snprintf(burl, sizeof(burl), "%s/api/fund/%s", base, s_fund_codes[i]);
         char *bp = http_get(burl);
         if (bp) {
+            ESP_LOGI(TAG, "Bridge resp: %.60s", bp);
             cJSON *br = cJSON_Parse(bp); free(bp);
             if (br) {
                 cJSON *item = cJSON_GetObjectItem(br, "nav");
                 if (item) { f->nav = (float)item->valuedouble; got++; }
+                else { ESP_LOGW(TAG, "Bridge: no nav field"); }
                 cJSON_Delete(br);
-            }
-        } else {
-            ESP_LOGW(TAG, "Fund %s: no data (keeping old nav=%.4f)", f->code, f->nav);
-        }
+            } else { ESP_LOGW(TAG, "Bridge: JSON parse fail"); }
+        } else { ESP_LOGW(TAG, "Fund %s: Bridge fallback fail", f->code); }
     }
     *count = s_fund_count;
     return (got > 0) ? ESP_OK : ESP_FAIL;
@@ -312,6 +339,20 @@ const char *get_bridge_url(void)
     return s_bridge_url;
 }
 
+static void get_bridge_base(char *buf, size_t sz)
+{
+    const char *url = get_bridge_url();
+    const char *s = strstr(url, "://");
+    if (!s) { strlcpy(buf, url, sz); return; }
+    s += 3;
+    const char *e = strchr(s, '/');
+    if (!e) { strlcpy(buf, url, sz); return; }
+    size_t base_len = e - url;
+    if (base_len >= sz) base_len = sz - 1;
+    memcpy(buf, url, base_len);
+    buf[base_len] = '\0';
+}
+
 void set_bridge_url(const char *url)
 {
     nvs_handle_t nvs;
@@ -324,22 +365,35 @@ void set_bridge_url(const char *url)
     }
 }
 
-/* ===== DeepSeek via bridge ===== */
+/* ===== DeepSeek 直连 (HTTPS, 不依赖 Bridge) ===== */
 esp_err_t api_fetch_deepseek(DeepSeekData_t *out)
 {
     char *resp = http_get(get_bridge_url());
     if (!resp) return ESP_FAIL;
     cJSON *root = cJSON_Parse(resp); free(resp);
     if (!root) return ESP_FAIL;
-    cJSON *item;
-    if ((item = cJSON_GetObjectItem(root, "balance"))) out->balance = (float)item->valuedouble;
-    if ((item = cJSON_GetObjectItem(root, "today_tokens"))) out->today_tokens_m = (float)item->valuedouble / 1e6f;
-    if ((item = cJSON_GetObjectItem(root, "today_cost"))) out->today_cost = (float)item->valuedouble;
-    if ((item = cJSON_GetObjectItem(root, "month_tokens"))) out->month_tokens_m = (float)item->valuedouble / 1e6f;
-    if ((item = cJSON_GetObjectItem(root, "month_cost"))) out->month_cost = (float)item->valuedouble;
-    if ((item = cJSON_GetObjectItem(root, "cache_hit_rate"))) out->cache_hit_rate = (float)item->valuedouble;
+
+    /* Bridge 格式 (有 today_tokens) */
+    cJSON *tt = cJSON_GetObjectItem(root, "today_tokens");
+    if (tt) {
+        out->today_tokens_m = (float)tt->valuedouble / 1e6f;
+        cJSON *i;
+        if ((i = cJSON_GetObjectItem(root, "balance")))     out->balance      = (float)i->valuedouble;
+        if ((i = cJSON_GetObjectItem(root, "today_cost"))) out->today_cost    = (float)i->valuedouble;
+        if ((i = cJSON_GetObjectItem(root, "month_tokens")))out->month_tokens_m=(float)i->valuedouble/1e6f;
+        if ((i = cJSON_GetObjectItem(root, "month_cost")))  out->month_cost   = (float)i->valuedouble;
+        if ((i = cJSON_GetObjectItem(root, "cache_hit_rate")))out->cache_hit_rate=(float)i->valuedouble;
+    } else {
+        /* DeepSeek 官方 API 格式 */
+        cJSON *infos = cJSON_GetObjectItem(root, "balance_infos");
+        if (infos && cJSON_IsArray(infos) && cJSON_GetArraySize(infos) > 0) {
+            cJSON *info = cJSON_GetArrayItem(infos, 0);
+            cJSON *tb = cJSON_GetObjectItem(info, "total_balance");
+            if (tb && tb->valuestring) out->balance = (float)atof(tb->valuestring);
+        }
+    }
     cJSON_Delete(root);
-    if (out->balance > 0) ESP_LOGI(TAG, "DS: %.2f", out->balance);
+    ESP_LOGI(TAG, "DS: %.2f", out->balance);
     return ESP_OK;
 }
 

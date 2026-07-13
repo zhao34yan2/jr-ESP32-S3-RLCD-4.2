@@ -100,6 +100,11 @@ def _udp_broadcast():
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    # 绑定到具体接口, 确保广播从正确网卡发出
+    try:
+        sock.bind((local_ip, 0))
+    except:
+        pass
     logger.info(f"UDP broadcast: {msg} (every 5s)")
     while True:
         try:
