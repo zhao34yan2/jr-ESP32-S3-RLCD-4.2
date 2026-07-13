@@ -132,14 +132,14 @@ static void create_weather_row(lv_obj_t *parent)
     lv_obj_align(line, LV_ALIGN_TOP_LEFT, 2, STATUS_H + WEATHER_H + 2);
 }
 
-/* ===== 贵金属行: 积存金 + 白银 ===== */
+/* ===== 贵金属行: 黄金 + 白银 ===== */
 static void create_gold_row(lv_obj_t *parent)
 {
     int y = STATUS_H + WEATHER_H + 5;
 
-    /* 积存金 */
+    /* 黄金 */
     ui_gold_text = lv_label_create(parent);
-    lv_label_set_text(ui_gold_text, "积存金 ---.-- 元/克");
+    lv_label_set_text(ui_gold_text, "黄金 ---.-- 元/克");
     lv_obj_set_style_text_color(ui_gold_text, C_BLACK, 0);
     lv_obj_set_style_text_font(ui_gold_text, &*FONT_CN, 0);
     lv_obj_align(ui_gold_text, LV_ALIGN_TOP_LEFT, 2, y);
@@ -158,7 +158,7 @@ static void create_gold_row(lv_obj_t *parent)
     lv_obj_align(line, LV_ALIGN_TOP_LEFT, 2, STATUS_H + WEATHER_H + GOLD_H);
 }
 
-/* ===== 白银 (在积存金下方) ===== */
+/* ===== 白银 (在黄金下方) ===== */
 /* 白银已移除 */
 
 /* ===== 主内容区: 左侧资产 + 右侧基金 ===== */
@@ -316,7 +316,7 @@ void ui_update_all(const AppData_t *app)
     lv_label_set_text(ui_status_date, date_buf);
 
     /* 室外天气 — 显示城市南京 */
-    if (app->weather.condition[0] != '\0' && app->weather.temp_max > -50) {
+    if (app->weather.condition[0] != '\0' && app->weather.temp_max > 0.5f) {
         snprintf(buf, sizeof(buf), "南京 %s %.0f~%.0f°C",
                  app->weather.condition,
                  app->weather.temp_min,
@@ -332,9 +332,9 @@ void ui_update_all(const AppData_t *app)
              app->weather.pm25 > 0 ? app->weather.pm25 : 35);
     lv_label_set_text(ui_weather_indoor, buf);
 
-    /* 积存金 */
+    /* 黄金 */
     if (app->gold.price > 1) {
-        snprintf(buf, sizeof(buf), "积存金 %.2f 元/克", app->gold.price);
+        snprintf(buf, sizeof(buf), "黄金 %.2f 元/克", app->gold.price);
         lv_label_set_text(ui_gold_text, buf);
         if (app->gold.high > 1 || app->gold.low > 1) {
             snprintf(buf, sizeof(buf), "低%.2f 高%.2f", app->gold.low, app->gold.high);
@@ -343,7 +343,7 @@ void ui_update_all(const AppData_t *app)
         }
         lv_label_set_text(ui_gold_change, buf);
     } else {
-        lv_label_set_text(ui_gold_text, "积存金 --- 元/克");
+        lv_label_set_text(ui_gold_text, "黄金 --- 元/克");
         lv_label_set_text(ui_gold_change, "等待联网...");
     }
 

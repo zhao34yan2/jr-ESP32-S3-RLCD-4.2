@@ -143,7 +143,7 @@ void dashboard_update(const AppData_t *app)
     snprintf(b, sizeof b, "星期%s", wd[ti.tm_wday]);
     lv_label_set_text(l_wkd, b);
     if (app->weather.condition[0]) lv_label_set_text(l_cond, app->weather.condition);
-    if (app->weather.temp_max > -50) {
+    if (app->weather.temp_max > 0.5f) {
         snprintf(b, sizeof b, "%.0f-%.0fC", app->weather.temp_min, app->weather.temp_max);
         lv_label_set_text(l_temp, b);
     }
@@ -201,7 +201,7 @@ void dashboard_update(const AppData_t *app)
         } else if (app->bat_drop_per_h < 0) {
             snprintf(b, sizeof b, "Charging..");
         } else {
-            snprintf(b, sizeof b, "电耗:%d%%/h", 1);
+            snprintf(b, sizeof b, "电耗:--%%/h");
         }
         lv_label_set_text(l_d3, b);
 

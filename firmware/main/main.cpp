@@ -57,7 +57,13 @@ static int read_battery_pct(void)
     int raw = 0;
     adc_oneshot_read(s_adc_handle, ADC_CHANNEL_3, &raw);
     /* 3倍分压: 满电4.2V→ADC≈1737, 空电3.3V→ADC≈1364 */
-    int pct = (raw - 1300) * 100 / (1639 - 1300);
+    /* Li-ion 分两段映射: 4.2V→3.8V (70-100%), 3.8V→3.3V (0-70%) */
+    int pct;
+    if (raw > 1500) {
+        pct = (raw - 1500) * 30 / (1639 - 1500) + 70;
+    } else {
+        pct = (raw - 1364) * 70 / (1500 - 1364);
+    }
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
     return pct;
@@ -179,7 +185,7 @@ static void battery_calc_trend(AppData_t *app)
     }
 
     float elapsed_h = (float)(now - s_bat_peak_ts) / 3600.0f;
-    if (elapsed_h < 0.1f) { /* 刚拔USB不到6分钟, 数据太少 */
+    if (elapsed_h < 0.5f) { /* 刚拔USB不到30分钟, 数据太少 (Li-ion电压还稳定) */
         app->bat_drop_per_h = -1;
         return;
     }
