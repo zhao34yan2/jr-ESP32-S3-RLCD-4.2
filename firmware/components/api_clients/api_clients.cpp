@@ -172,6 +172,11 @@ esp_err_t api_fetch_weather(WeatherData_t *out)
                     j++;
                 }
                 out->fc_cond[i][j] = '\0';
+                ESP_LOGI(TAG, "FC[%d]: code=%d bytes=%02x%02x%02x",
+                         i, wc,
+                         (uint8_t)out->fc_cond[i][0],
+                         (uint8_t)out->fc_cond[i][1],
+                         (uint8_t)out->fc_cond[i][2]);
             }
             out->fc_count++;
         }
