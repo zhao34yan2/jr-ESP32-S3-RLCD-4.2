@@ -165,7 +165,7 @@ void dashboard_update(const AppData_t *app)
         struct tm fd = ti;
         fd.tm_mday += i;
         mktime(&fd);
-        snprintf(b, sizeof b, "%02d/%02d|%s %.0f-%.0fC",
+        snprintf(b, sizeof b, "%02d/%02d %s %.0f-%.0fC",
                  fd.tm_mon+1, fd.tm_mday,
                  app->weather.fc_cond[i],
                  app->weather.fc_min[i], app->weather.fc_max[i]);

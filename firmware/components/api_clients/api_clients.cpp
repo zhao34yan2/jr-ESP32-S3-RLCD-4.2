@@ -171,12 +171,16 @@ esp_err_t api_fetch_weather(WeatherData_t *out)
                     out->fc_cond[i][j] = src[j];
                     j++;
                 }
-                out->fc_cond[i][j] = '\0';
-                ESP_LOGI(TAG, "FC[%d]: code=%d bytes=%02x%02x%02x",
+                /* 调试: 打印原始字节 */
+                ESP_LOGI(TAG, "FC[%d]: code=%d raw=%02x%02x%02x%02x%02x%02x",
                          i, wc,
                          (uint8_t)out->fc_cond[i][0],
                          (uint8_t)out->fc_cond[i][1],
-                         (uint8_t)out->fc_cond[i][2]);
+                         (uint8_t)out->fc_cond[i][2],
+                         (uint8_t)out->fc_cond[i][3],
+                         (uint8_t)out->fc_cond[i][4],
+                         (uint8_t)out->fc_cond[i][5]);
+                out->fc_cond[i][j] = '\0';
             }
             out->fc_count++;
         }
