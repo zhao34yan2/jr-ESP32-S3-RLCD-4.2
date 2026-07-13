@@ -57,7 +57,7 @@ static int read_battery_pct(void)
     int raw = 0;
     adc_oneshot_read(s_adc_handle, ADC_CHANNEL_3, &raw);
     /* 3倍分压: 满电4.2V→ADC≈1737, 空电3.3V→ADC≈1364 */
-    int pct = (raw - 1200) * 100 / (1639 - 1200);
+    int pct = (raw - 1300) * 100 / (1639 - 1300);
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
     return pct;
@@ -76,6 +76,7 @@ typedef struct {
 
 static nvs_handle_t s_bat_nvs = 0;
 static int32_t s_bat_log_count = 0;
+static int32_t s_bat_next_idx = 0;    /* 环形缓冲区的下一个写入位置 */
 static int32_t s_bat_peak_pct = -1;  /* 最高电量 (充满基准) */
 static uint32_t s_bat_peak_ts = 0;
 
@@ -86,30 +87,14 @@ static void battery_log_init(void)
         ESP_LOGW("BAT", "NVS open fail: %d", err);
         return;
     }
-    /* 读取已有记录数 */
-    size_t sz = sizeof(s_bat_log_count);
     nvs_get_i32(s_bat_nvs, "count", &s_bat_log_count);
+    nvs_get_i32(s_bat_nvs, "next", &s_bat_next_idx);
     if (s_bat_log_count > BAT_LOG_MAX) s_bat_log_count = BAT_LOG_MAX;
-    /* 读取第一条数据用于趋势计算 */
-    /* 读最高记录作为放电基准 */
+    if (s_bat_next_idx >= BAT_LOG_MAX) s_bat_next_idx = 0;
     nvs_get_i32(s_bat_nvs, "peak", &s_bat_peak_pct);
     nvs_get_i32(s_bat_nvs, "peak_ts", (int32_t *)&s_bat_peak_ts);
     ESP_LOGI("BAT", "Log init: %d records, peak=%d%%", s_bat_log_count, s_bat_peak_pct);
 
-    /* 导出日志用于分析 */
-    if (s_bat_log_count > 0) {
-        ESP_LOGI("BAT", "=== Battery Log Dump (ts, pct) ===");
-        for (int i = 0; i < s_bat_log_count; i++) {
-            char k[16];
-            snprintf(k, sizeof(k), "rec%d", i);
-            BatRec_t r = {};
-            size_t rs = sizeof(BatRec_t);
-            if (nvs_get_blob(s_bat_nvs, k, &r, &rs) == ESP_OK && r.ts > 0) {
-                ESP_LOGI("BAT", "%d,%d", r.ts, r.pct);
-            }
-        }
-        ESP_LOGI("BAT", "=== End ===");
-    }
 }
 
 static void battery_log_save(int pct)
@@ -130,32 +115,19 @@ static void battery_log_save(int pct)
         if (now - last.ts < BAT_LOG_INTERVAL_MS / 1000) return; /* 间隔未到 */
     }
 
-    /* 环形写入 */
-    int write_idx = (int)s_bat_log_count;
-    if (write_idx >= BAT_LOG_MAX) {
-        /* 满了, 覆盖最早一条, 整体前移 */
-        for (int i = 1; i < BAT_LOG_MAX; i++) {
-            char k_old[16], k_new[16];
-            snprintf(k_old, sizeof(k_old), "rec%d", i);
-            snprintf(k_new, sizeof(k_new), "rec%d", i - 1);
-            BatRec_t tmp = {};
-            size_t tsz = sizeof(BatRec_t);
-            if (nvs_get_blob(s_bat_nvs, k_old, &tmp, &tsz) == ESP_OK) {
-                nvs_set_blob(s_bat_nvs, k_new, &tmp, sizeof(BatRec_t));
-            }
-        }
-        write_idx = BAT_LOG_MAX - 1;
-        s_bat_log_count = BAT_LOG_MAX;
-    } else {
-        s_bat_log_count++;
-    }
-
+    /* 环形缓冲: 写入 next_idx, 然后推进 */
+    int write_idx = (int)s_bat_next_idx;
     BatRec_t rec;
     rec.ts = (uint32_t)now;
     rec.pct = (uint8_t)pct;
     snprintf(key, sizeof(key), "rec%d", write_idx);
     nvs_set_blob(s_bat_nvs, key, &rec, sizeof(BatRec_t));
-    nvs_set_i32(s_bat_nvs, "count", (int32_t)s_bat_log_count);
+
+    s_bat_next_idx++;
+    if (s_bat_next_idx >= BAT_LOG_MAX) s_bat_next_idx = 0;
+    nvs_set_i32(s_bat_nvs, "next", (int32_t)s_bat_next_idx);
+
+    if (s_bat_log_count < BAT_LOG_MAX) s_bat_log_count++;
 
     /* 更新峰值: 仅当明显上升(>=3%)才视为充电, 忽略ADC波动 */
     if (s_bat_peak_pct < 0 || pct > s_bat_peak_pct + 3) {
