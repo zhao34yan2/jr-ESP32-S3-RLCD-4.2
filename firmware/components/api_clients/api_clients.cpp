@@ -21,6 +21,9 @@
 
 static const char *TAG = "API";
 
+/* Bridge URL 更新标志 — api_task 轮询此标志, 发现变化立即重拉数据 */
+volatile int g_bridge_url_changed = 0;
+
 /* ===== Default fund codes ===== */
 static const char *s_fund_codes[] = {
     "007280",  /* 摩根日本精选股票(QDII)A */
@@ -370,6 +373,7 @@ void set_bridge_url(const char *url)
         nvs_commit(nvs);
         nvs_close(nvs);
         strlcpy(s_bridge_url, url, sizeof(s_bridge_url));
+        g_bridge_url_changed = 1;
         ESP_LOGI(TAG, "Bridge URL updated: %s", url);
     }
 }

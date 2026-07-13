@@ -308,6 +308,14 @@ static void api_task(void *pv)
 
 /* 白银已移除 */
 
+        /* Bridge URL 更新 => 立即重拉数据 */
+        if (g_bridge_url_changed) {
+            g_bridge_url_changed = 0;
+            ESP_LOGI(TAG, "Bridge URL changed, re-fetching...");
+            last_fund = -pdMS_TO_TICKS(1000);  /* 立即触发 */
+            last_ds = -pdMS_TO_TICKS(1000);    /* 立即触发 */
+        }
+
         /* DeepSeek (1分钟, 通过 bridge) — 需 WiFi */
         if (wifi_ok && now - last_ds >= pdMS_TO_TICKS(DEEPSEEK_REFRESH_SEC * 1000)) {
             last_ds = now;

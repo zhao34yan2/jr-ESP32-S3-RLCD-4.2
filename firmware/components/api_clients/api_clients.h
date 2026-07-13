@@ -117,6 +117,9 @@ esp_err_t api_fetch_silver(SilverData_t *out);
  */
 esp_err_t api_fetch_funds(FundItem_t *funds, int *count);
 
+/* Bridge URL 更新标志 (api_task 轮询后重拉基金/DS) */
+extern volatile int g_bridge_url_changed;
+
 /**
  * @brief 获取 DeepSeek 用量 (通过 bridge)
  */
