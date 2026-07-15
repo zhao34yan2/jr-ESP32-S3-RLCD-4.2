@@ -12,6 +12,7 @@
 #include <esp_chip_info.h>
 #include <esp_heap_caps.h>
 #include <esp_idf_version.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <lvgl.h>
@@ -205,9 +206,9 @@ void dashboard_update(const AppData_t *app)
         }
         lv_label_set_text(l_d3, b);
 
-        uint32_t ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        uint64_t us = esp_timer_get_time();
         snprintf(b, sizeof b, "Up: %uh%02um",
-                 (unsigned)(ms/3600000), (unsigned)((ms%3600000)/60000));
+                 (unsigned)(us/3600000000ULL), (unsigned)((us%3600000000ULL)/60000000ULL));
         lv_label_set_text(l_d4, b);
     }
 

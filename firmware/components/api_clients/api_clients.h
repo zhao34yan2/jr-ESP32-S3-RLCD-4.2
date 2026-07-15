@@ -43,15 +43,6 @@ typedef struct {
     int   is_up;             /* 1=涨, 0=跌 */
 } GoldData_t;
 
-/* 白银信息 — 元/千克 */
-typedef struct {
-    float price;             /* 当前价格 (元/千克) */
-    float change;            /* 涨跌额 */
-    float high;              /* 日内最高 */
-    float low;               /* 日内最低 */
-    int   is_up;             /* 1=涨, 0=跌 */
-} SilverData_t;
-
 /* DeepSeek 用量 */
 typedef struct {
     float balance;           /* 余额 (¥) */
@@ -72,17 +63,12 @@ typedef struct {
     /* 天气 */
     WeatherData_t weather;
 
-    /* 积存金 */
+    /* 黄金 */
     GoldData_t gold;
-
-    /* 白银 */
-    SilverData_t silver;
 
     /* 基金 */
     FundItem_t funds[MAX_FUNDS];
     int   fund_count;
-    float total_value;       /* 总市值 */
-    float total_change;      /* 总盈亏 */
 
     /* DeepSeek */
     DeepSeekData_t ds;
@@ -107,11 +93,6 @@ esp_err_t api_fetch_weather(WeatherData_t *out);
 esp_err_t api_fetch_gold(GoldData_t *out);
 
 /**
- * @brief 获取白银价格 (东方财富, AG9999)
- */
-esp_err_t api_fetch_silver(SilverData_t *out);
-
-/**
  * @brief 获取基金实时估值
  * @param funds 输出基金数组
  * @param count 输出数量
@@ -128,16 +109,6 @@ extern volatile int g_data_locked;
  * @brief 获取 DeepSeek 用量 (通过 bridge)
  */
 esp_err_t api_fetch_deepseek(DeepSeekData_t *out);
-
-/**
- * @brief 计算基金总资产摘要
- */
-void api_calc_summary(AppData_t *app);
-
-/**
- * @brief 注册默认基金代码列表
- */
-void api_set_fund_codes(const char *codes[], int count);
 
 /**
  * @brief 获取 Bridge URL (NVS > 编译默认)

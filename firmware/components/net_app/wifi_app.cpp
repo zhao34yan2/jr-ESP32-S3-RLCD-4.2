@@ -143,7 +143,7 @@ void get_time_str(char *buf)
     struct tm ti = {0};
     time(&now);
     localtime_r(&now, &ti);
-    sprintf(buf, "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec);
+    snprintf(buf, 24, "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec);
 }
 
 void get_date_str(char *buf)

@@ -33,7 +33,6 @@
 #include "secrets.h"
 
 /* Custom SimHei font for Chinese characters (1bpp) */
-LV_FONT_DECLARE(custom_font_13_big);
 LV_FONT_DECLARE(custom_font_14_big);
 #define FONT_CN  (&custom_font_14_big)
 #define FONT_CN_BIG (&custom_font_14_big)

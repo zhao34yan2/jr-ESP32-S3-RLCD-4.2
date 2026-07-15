@@ -111,7 +111,7 @@ def _udp_broadcast():
             sock.sendto(msg.encode(), ("255.255.255.255", 7777))
         except Exception as e:
             logger.warning(f"UDP broadcast error: {e}")
-        threading.Event().wait(5)
+        time.sleep(5)
 
 
 @asynccontextmanager

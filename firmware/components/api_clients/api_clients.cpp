@@ -35,13 +35,6 @@ static const char *s_fund_codes[] = {
 };
 static int s_fund_count = 3;
 
-void api_set_fund_codes(const char *codes[], int count)
-{
-    if (count > MAX_FUNDS) count = MAX_FUNDS;
-    s_fund_count = count;
-    for (int i = 0; i < count; i++) s_fund_codes[i] = codes[i];
-}
-
 /* ===== HTTP GET over raw socket ===== */
 static char *http_get(const char *url)
 {
@@ -238,9 +231,6 @@ esp_err_t api_fetch_gold(GoldData_t *out)
     return ESP_OK;
 }
 
-/* ===== Silver stub ===== */
-esp_err_t api_fetch_silver(SilverData_t *out) { return ESP_FAIL; }
-
 /* ===== HTTPS GET using esp_http_client (支持自定义头) ===== */
 static char *https_get(const char *url, const char *header_key, const char *header_val)
 {
@@ -416,10 +406,3 @@ esp_err_t api_fetch_deepseek(DeepSeekData_t *out)
     return ESP_OK;
 }
 
-/* ===== Summary ===== */
-void api_calc_summary(AppData_t *app)
-{
-    float total = 0;
-    for (int i = 0; i < app->fund_count; i++) total += app->funds[i].nav * 10000;
-    app->total_value = total;
-}

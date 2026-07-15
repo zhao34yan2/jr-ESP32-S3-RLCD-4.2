@@ -47,12 +47,8 @@
 #define FUND_REFRESH_SEC        1800    /* 30 分钟 */
 #define DEEPSEEK_REFRESH_SEC    300     /* 5 分钟 */
 #define SENSOR_REFRESH_SEC      60      /* 1 分钟 */
-#define UI_REFRESH_MS           50      /* LVGL 刷新周期 */
 
 /* LVGL 缓冲区 */
 #define LVGL_BUF_SIZE       (LCD_WIDTH * 40)
-
-/* WiFi 重连间隔 */
-#define WIFI_RETRY_MS       30000
 
 #endif /* USER_CONFIG_H */
