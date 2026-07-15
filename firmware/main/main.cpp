@@ -50,12 +50,17 @@ static int read_battery_pct(void)
 {
     if (!s_adc_handle) {
         adc_oneshot_unit_init_cfg_t init_cfg = { .unit_id = ADC_UNIT_1 };
-        adc_oneshot_new_unit(&init_cfg, &s_adc_handle);
+        if (adc_oneshot_new_unit(&init_cfg, &s_adc_handle) != ESP_OK) {
+            ESP_LOGE(TAG, "ADC unit init fail");
+            return -1;
+        }
         adc_oneshot_chan_cfg_t chan_cfg = { .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_12 };
         adc_oneshot_config_channel(s_adc_handle, ADC_CHANNEL_3, &chan_cfg);
     }
     int raw = 0;
-    adc_oneshot_read(s_adc_handle, ADC_CHANNEL_3, &raw);
+    if (adc_oneshot_read(s_adc_handle, ADC_CHANNEL_3, &raw) != ESP_OK) {
+        return -1;
+    }
     /* 3倍分压: 满电4.2V→ADC≈1737, 空电3.3V→ADC≈1364 */
     /* Li-ion 分两段映射: 4.2V→3.8V (70-100%), 3.8V→3.3V (0-70%) */
     int pct;
@@ -70,8 +75,8 @@ static int read_battery_pct(void)
 }
 
 /* ===== 电池电量日志 (NVS) ===== */
-#define BAT_LOG_INTERVAL_MS  600000   /* 每10分钟记一条 */
-#define BAT_LOG_MAX          432      /* 保留3天 */
+#define BAT_LOG_INTERVAL_MS  1800000  /* 每30分钟记一条 */
+#define BAT_LOG_MAX          72       /* 保留36小时 */
 #define BAT_LOG_KEY          "bat_log"
 
 /* 日志格式: 4字节时间戳 + 1字节电量% */
@@ -226,6 +231,7 @@ static void lvgl_flush_cb(lv_display_t *drv, const lv_area_t *area, uint8_t *col
 
 /* ===== 全局数据缓存 ===== */
 static AppData_t g_app_data = {};
+static portMUX_TYPE s_data_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /* ===== 传感器读取任务 ===== */
 static void sensor_task(void *pv)
@@ -235,8 +241,10 @@ static void sensor_task(void *pv)
         if (shtc3_read(&temp, &hum) == ESP_OK) {
             /* 合理性检查：温度 0~80°C（板子发热可能偏高），湿度 0~100% */
             if (hum >= 0 && hum <= 100) {
+                taskENTER_CRITICAL(&s_data_lock);
                 g_app_data.indoor_temp = temp;
                 g_app_data.indoor_hum  = hum;
+                taskEXIT_CRITICAL(&s_data_lock);
                 ESP_LOGI(TAG, "SHTC3: %.1f°C %.1f%%RH", temp, hum);
             }
         } else {
@@ -264,32 +272,44 @@ static void api_task(void *pv)
         /* 天气 (5分钟) — 需 WiFi */
         if (wifi_ok && now - last_weather >= pdMS_TO_TICKS(WEATHER_REFRESH_SEC * 1000)) {
             last_weather = now;
-            if (api_fetch_weather(&g_app_data.weather) == ESP_OK) {
-                ESP_LOGI(TAG, "Weather: %s %.1f°C", g_app_data.weather.condition,
-                         g_app_data.weather.temp_outdoor);
+            WeatherData_t tw = {};
+            if (api_fetch_weather(&tw) == ESP_OK) {
+                taskENTER_CRITICAL(&s_data_lock);
+                g_app_data.weather = tw;
+                taskEXIT_CRITICAL(&s_data_lock);
+                ESP_LOGI(TAG, "Weather: %s %.1f°C", tw.condition, tw.temp_outdoor);
             } else {
-                last_weather -= pdMS_TO_TICKS(60000); /* 失败后1分钟重试 */
+                last_weather = now - pdMS_TO_TICKS(WEATHER_REFRESH_SEC * 1000) + pdMS_TO_TICKS(60000);
             }
         }
 
         /* 基金 (30分钟) — 需 WiFi */
         if (wifi_ok && now - last_fund >= pdMS_TO_TICKS(FUND_REFRESH_SEC * 1000)) {
             last_fund = now;
-            if (api_fetch_funds(g_app_data.funds, &g_app_data.fund_count) == ESP_OK) {
-                ESP_LOGI(TAG, "Funds: %d items", g_app_data.fund_count);
-                api_calc_summary(&g_app_data);
+            FundItem_t tf[MAX_FUNDS];
+            int tc = 0;
+            if (api_fetch_funds(tf, &tc) == ESP_OK) {
+                taskENTER_CRITICAL(&s_data_lock);
+                memcpy(g_app_data.funds, tf, sizeof(tf));
+                g_app_data.fund_count = tc;
+                taskEXIT_CRITICAL(&s_data_lock);
+                ESP_LOGI(TAG, "Funds: %d items", tc);
             } else {
-                last_fund -= pdMS_TO_TICKS(30000);
+                last_fund = now - pdMS_TO_TICKS(FUND_REFRESH_SEC * 1000) + pdMS_TO_TICKS(60000);
             }
         }
 
         /* 黄金 (30分钟) — 需 WiFi */
         if (wifi_ok && now - last_gold >= pdMS_TO_TICKS(GOLD_REFRESH_SEC * 1000)) {
             last_gold = now;
-            if (api_fetch_gold(&g_app_data.gold) == ESP_OK) {
-                ESP_LOGI(TAG, "Gold: %.2f 元/克", g_app_data.gold.price);
+            GoldData_t tg = {};
+            if (api_fetch_gold(&tg) == ESP_OK) {
+                taskENTER_CRITICAL(&s_data_lock);
+                g_app_data.gold = tg;
+                taskEXIT_CRITICAL(&s_data_lock);
+                ESP_LOGI(TAG, "Gold: %.2f 元/克", tg.price);
             } else {
-                last_gold -= pdMS_TO_TICKS(30000);
+                last_gold = now - pdMS_TO_TICKS(GOLD_REFRESH_SEC * 1000) + pdMS_TO_TICKS(60000);
             }
         }
 
@@ -299,17 +319,21 @@ static void api_task(void *pv)
         if (g_bridge_url_changed) {
             g_bridge_url_changed = 0;
             ESP_LOGI(TAG, "Bridge URL changed, re-fetching...");
-            last_fund = -pdMS_TO_TICKS(1000);  /* 立即触发 */
-            last_ds = -pdMS_TO_TICKS(1000);    /* 立即触发 */
+            last_fund = -pdMS_TO_TICKS(1000);
+            last_ds = -pdMS_TO_TICKS(1000);
         }
 
         /* DeepSeek (1分钟, 通过 bridge) — 需 WiFi */
         if (wifi_ok && now - last_ds >= pdMS_TO_TICKS(DEEPSEEK_REFRESH_SEC * 1000)) {
             last_ds = now;
-            if (api_fetch_deepseek(&g_app_data.ds) == ESP_OK) {
-                ESP_LOGI(TAG, "DS balance: ¥%.2f", g_app_data.ds.balance);
+            DeepSeekData_t td = {};
+            if (api_fetch_deepseek(&td) == ESP_OK) {
+                taskENTER_CRITICAL(&s_data_lock);
+                g_app_data.ds = td;
+                taskEXIT_CRITICAL(&s_data_lock);
+                ESP_LOGI(TAG, "DS balance: ¥%.2f", td.balance);
             } else {
-                last_ds -= pdMS_TO_TICKS(30000);
+                last_ds = now - pdMS_TO_TICKS(DEEPSEEK_REFRESH_SEC * 1000) + pdMS_TO_TICKS(30000);
             }
         }
 
@@ -346,11 +370,15 @@ static void ui_task(void *pv)
             }
             g_key_last = key;
 
-            /* 更新当前页面数据 */
+            /* 安全读取 (锁住数据, 快速拷贝, 释放锁) */
+            AppData_t local_data;
+            taskENTER_CRITICAL(&s_data_lock);
+            memcpy(&local_data, &g_app_data, sizeof(AppData_t));
+            taskEXIT_CRITICAL(&s_data_lock);
             if (g_page == 0)
-                ui_update_all(&g_app_data);
+                ui_update_all(&local_data);
             else
-                dashboard_update(&g_app_data);
+                dashboard_update(&local_data);
 
             Lvgl_unlock();
         }
@@ -376,6 +404,12 @@ static void bridge_discovery_task(void *pv)
     addr.sin_port = htons(7777);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     bind(sock, (struct sockaddr *)&addr, sizeof(addr));
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        ESP_LOGE(TAG, "Discovery bind fail");
+        close(sock);
+        return;
+    }
 
     struct timeval tv = {3, 0};
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));

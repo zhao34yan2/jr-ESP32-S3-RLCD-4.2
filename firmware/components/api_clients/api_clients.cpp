@@ -24,6 +24,9 @@ static const char *TAG = "API";
 /* Bridge URL 更新标志 — api_task 轮询此标志, 发现变化立即重拉数据 */
 volatile int g_bridge_url_changed = 0;
 
+/* 数据更新锁 */
+volatile int g_data_locked = 0;
+
 /* ===== Default fund codes ===== */
 static const char *s_fund_codes[] = {
     "007280",  /* 摩根日本精选股票(QDII)A */
@@ -143,7 +146,7 @@ esp_err_t api_fetch_weather(WeatherData_t *out)
             out->temp_outdoor = (float)item->valuedouble;
         if ((item = cJSON_GetObjectItem(cur, "weather_code"))) {
             int w = (int)item->valuedouble;
-            strcpy(out->condition, code_to_cond(w));
+            strlcpy(out->condition, code_to_cond(w), sizeof(out->condition));
         }
 
         cJSON *tmax = cJSON_GetObjectItem(day, "temperature_2m_max");
@@ -211,6 +214,7 @@ esp_err_t api_fetch_gold(GoldData_t *out)
     *end = '\0';
 
     int field = 0;
+    float prev_close = 0;
     char *tok = p;
     while (tok && *tok) {
         char *comma = strchr(tok, ',');
@@ -218,7 +222,7 @@ esp_err_t api_fetch_gold(GoldData_t *out)
         char *val = tok;
         while (*val == ' ') val++;
         switch (field) {
-            case 2: { float pv = (float)atof(val); out->change = out->price - pv; break; }
+            case 2: prev_close = (float)atof(val); break;  /* 昨收盘 */
             case 3: { float v = (float)atof(val); if (v > 0.001f) out->high  = v; break; }
             case 4: { float v = (float)atof(val); if (v > 0.001f) out->low   = v; break; }
             case 6: { float v = (float)atof(val); if (v > 0.001f) out->price = v; break; }
@@ -226,6 +230,8 @@ esp_err_t api_fetch_gold(GoldData_t *out)
         tok = comma;
         field++;
     }
+    /* 循环结束后用本次价格统一计算涨跌 */
+    out->change = out->price - prev_close;
     out->is_up = (out->change >= 0) ? 1 : 0;
     free(resp);
     ESP_LOGI(TAG, "Gold: %.2f h%.2f l%.2f", out->price, out->high, out->low);
