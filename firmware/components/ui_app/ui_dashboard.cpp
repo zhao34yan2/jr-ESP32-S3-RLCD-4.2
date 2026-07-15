@@ -24,7 +24,7 @@ static const char *TAG = "DASH";
 #define C_BLACK lv_color_black()
 #define C_WHITE lv_color_white()
 
-/* 与 ui_main.cpp 完全一致的字体声明 — 不用 extern "C" */
+/* 与 ui_main.cpp 完全一致的字体声明 */
 LV_FONT_DECLARE(custom_font_14_big);
 #define FONT_CN  (&custom_font_14_big)
 
@@ -165,7 +165,7 @@ void dashboard_update(const AppData_t *app)
         struct tm fd = ti;
         fd.tm_mday += i;
         mktime(&fd);
-        snprintf(b, sizeof b, "%02d/%02d-%s %.0f-%.0fC",
+        snprintf(b, sizeof b, "%02d/%02d %s %.0f-%.0fC",
                  fd.tm_mon+1, fd.tm_mday,
                  app->weather.fc_cond[i],
                  app->weather.fc_min[i], app->weather.fc_max[i]);
@@ -194,7 +194,7 @@ void dashboard_update(const AppData_t *app)
 
         /* 电量趋势 (替代PSRAM行) */
         if (app->bat_log_count < 2) {
-            snprintf(b, sizeof b, "电耗:记录中..");
+            snprintf(b, sizeof b, "电耗:等待中..");
         } else if (app->bat_drop_per_h > 0) {
             snprintf(b, sizeof b, "电耗:%d%%/h %dh",
                      app->bat_drop_per_h, app->bat_est_hours);

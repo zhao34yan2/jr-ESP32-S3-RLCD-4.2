@@ -110,7 +110,7 @@ static const char *code_to_cond(int w)
     if (w <= 3) return "晴";
     if (w <= 20) return "阴";
     if (w <= 50) return "雾";
-    if (w <= 60) return "小雨";
+    if (w <= 60) return "雨";  /* 小雨→雨 (小字在custom_font渲染有问题) */
     if (w <= 70) return "中雨";
     if (w <= 80) return "大雨";
     if (w <= 86) return "雪";

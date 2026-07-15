@@ -62,7 +62,7 @@ static int read_battery_pct(void)
     if (raw > 1500) {
         pct = (raw - 1500) * 30 / (1639 - 1500) + 70;
     } else {
-        pct = (raw - 1364) * 70 / (1500 - 1364);
+        pct = (raw - 1280) * 70 / (1500 - 1280);
     }
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
@@ -85,6 +85,9 @@ static int32_t s_bat_log_count = 0;
 static int32_t s_bat_next_idx = 0;    /* 环形缓冲区的下一个写入位置 */
 static int32_t s_bat_peak_pct = -1;  /* 最高电量 (充满基准) */
 static uint32_t s_bat_peak_ts = 0;
+static int s_chg_start_pct = -1;     /* 充电起始电量 (用于时间估算) */
+static uint32_t s_chg_start_ts = 0;
+static int s_chg_reported = -1;      /* 已上报的充电电量 (限速用) */
 
 static void battery_log_init(void)
 {
@@ -178,11 +181,17 @@ static void battery_calc_trend(AppData_t *app)
     int dropped = s_bat_peak_pct - app->battery_pct;
 
     if (dropped <= 0) {
-        /* 电池等于或高于峰值: 充电中 */
+        /* 充电中: 保持插电时的电压推算电量, 充满才显示100% */
+        if (s_chg_reported < 0) s_chg_reported = app->battery_pct;
+        if (app->battery_pct >= 98) s_chg_reported = 100;
+        app->bat_charge_pct = (s_chg_reported > 100) ? 100 : s_chg_reported;
         app->bat_drop_per_h = -1;
         app->bat_est_hours = 999;
         return;
     }
+    /* 放电时重置充电状态 */
+    s_chg_start_pct = -1;
+    s_chg_reported = -1;
 
     float elapsed_h = (float)(now - s_bat_peak_ts) / 3600.0f;
     if (elapsed_h < 0.5f) { /* 刚拔USB不到30分钟, 数据太少 (Li-ion电压还稳定) */

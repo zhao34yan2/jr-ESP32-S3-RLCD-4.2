@@ -296,8 +296,13 @@ void ui_update_all(const AppData_t *app)
 
     /* 电池 */
     if (ui_battery) {
-        snprintf(buf, sizeof(buf), "电量 %d%%", app->battery_pct);
-        lv_label_set_text(ui_battery, buf);
+        if (app->bat_drop_per_h < 0) {
+            snprintf(buf, sizeof(buf), "充电 %d%%", app->bat_charge_pct);
+            lv_label_set_text(ui_battery, buf);
+        } else {
+            snprintf(buf, sizeof(buf), "电量 %d%%", app->battery_pct);
+            lv_label_set_text(ui_battery, buf);
+        }
     }
 
     /* WiFi 状态 + 日期 */
