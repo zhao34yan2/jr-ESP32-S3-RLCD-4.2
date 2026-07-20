@@ -225,21 +225,18 @@ static void create_ds_section(lv_obj_t *parent)
     lv_obj_set_style_border_width(div, 0, 0);
     lv_obj_align(div, LV_ALIGN_TOP_LEFT, 4, y);
 
-    /* 第1行: >今日余额 + cache命中率 */
-    /* 第1行: DeepSeek */
+    /* DeepSeek 标题 + 余额 (同行, 左标题右余额) */
     lv_obj_t *ds_t = lv_label_create(parent);
     lv_label_set_text(ds_t, "DeepSeek");
     lv_obj_set_style_text_color(ds_t, C_BLACK, 0);
     lv_obj_set_style_text_font(ds_t, &lv_font_montserrat_12, 0);
     lv_obj_align(ds_t, LV_ALIGN_TOP_LEFT, 4, y + 1);
 
-    /* 第2行: 余额 (真实数据, 其他为假数据已移除) */
     ui_ds_balance = lv_label_create(parent);
     lv_label_set_text(ui_ds_balance, "余额 --.--");
-    lv_obj_set_width(ui_ds_balance, 140);
     lv_obj_set_style_text_color(ui_ds_balance, C_BLACK, 0);
     lv_obj_set_style_text_font(ui_ds_balance, &*FONT_CN, 0);
-    lv_obj_align(ui_ds_balance, LV_ALIGN_TOP_LEFT, 4, y + 14);
+    lv_obj_align(ui_ds_balance, LV_ALIGN_TOP_RIGHT, -4, y + 1);
 
 }
 
