@@ -28,6 +28,12 @@ void i2c_master_init(void);
  */
 esp_err_t shtc3_read(float *temperature, float *humidity);
 
+/**
+ * @brief 设置室温基准 (开机早期调用, 芯片还没发热)
+ * @param temp_c 首次读取的原始温度值
+ */
+void shtc3_set_baseline(float temp_c);
+
 #ifdef __cplusplus
 }
 #endif

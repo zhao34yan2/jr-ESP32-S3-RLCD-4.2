@@ -166,10 +166,14 @@ void dashboard_update(const AppData_t *app)
         struct tm fd = ti;
         fd.tm_mday += i;
         mktime(&fd);
-        snprintf(b, sizeof b, "%02d/%02d %s %.0f-%.0fC",
+        snprintf(b, sizeof b, "%02d/%02d%s %.0f-%.0fC",
                  fd.tm_mon+1, fd.tm_mday,
                  app->weather.fc_cond[i],
                  app->weather.fc_min[i], app->weather.fc_max[i]);
+        ESP_LOGI(TAG, "FC show[%d]: '%s' hex=%02x%02x%02x%02x%02x%02x",
+                 i, b,
+                 (uint8_t)b[0], (uint8_t)b[1], (uint8_t)b[2],
+                 (uint8_t)b[3], (uint8_t)b[4], (uint8_t)b[5]);
         lv_label_set_text(l_fc[i], b);
     }
 

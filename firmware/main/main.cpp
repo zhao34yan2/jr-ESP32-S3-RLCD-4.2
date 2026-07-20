@@ -61,13 +61,21 @@ static int read_battery_pct(void)
     if (adc_oneshot_read(s_adc_handle, ADC_CHANNEL_3, &raw) != ESP_OK) {
         return -1;
     }
-    /* 3倍分压: 满电4.2V→ADC≈1737, 空电3.3V→ADC≈1364 */
-    /* Li-ion 分两段映射: 4.2V→3.8V (70-100%), 3.8V→3.3V (0-70%) */
-    int pct;
-    if (raw > 1500) {
-        pct = (raw - 1500) * 30 / (1639 - 1500) + 70;
+    /* Li-ion 查表映射 (ADC → 电量%), 中间插值 */
+    static const int lut_adc[] = {1639,1600,1570,1540,1510,1480,1450,1420,1390,1360,1330,1300,1280};
+    static const int lut_pct[] = {100, 93,  85,  75,  65,  55,  45,  35,  25,  15,  8,   3,   0};
+    int pct = 0;
+    if (raw >= lut_adc[0]) {
+        pct = 100;
+    } else if (raw <= lut_adc[12]) {
+        pct = 0;
     } else {
-        pct = (raw - 1280) * 70 / (1500 - 1280);
+        for (int i = 0; i < 12; i++) {
+            if (raw >= lut_adc[i+1] && raw < lut_adc[i]) {
+                pct = lut_pct[i] + (raw - lut_adc[i]) * (lut_pct[i+1] - lut_pct[i]) / (lut_adc[i+1] - lut_adc[i]);
+                break;
+            }
+        }
     }
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
@@ -92,7 +100,7 @@ static int32_t s_bat_peak_pct = -1;  /* 最高电量 (充满基准) */
 static uint32_t s_bat_peak_ts = 0;
 static int s_chg_start_pct = -1;     /* 充电起始电量 (用于时间估算) */
 static uint32_t s_chg_start_ts = 0;
-static int s_chg_reported = -1;      /* 已上报的充电电量 (限速用) */
+static int s_chg_reported = -1;      /* 已上报的充电电量 */
 
 static void battery_log_init(void)
 {
@@ -185,9 +193,20 @@ static void battery_calc_trend(AppData_t *app)
     uint32_t now = (uint32_t)time(NULL);
     int dropped = s_bat_peak_pct - app->battery_pct;
 
-    if (dropped <= 0) {
-        /* 充电中: 保持插电时的电压推算电量, 充满才显示100% */
-        if (s_chg_reported < 0) s_chg_reported = app->battery_pct;
+    /* 检测充电: 电量比上次高 = 在充电 (即使峰值更高) */
+    static int s_prev_pct = -1;
+    int is_charging = (dropped <= 0);
+    if (!is_charging && s_prev_pct >= 0 && app->battery_pct > s_prev_pct + 2) {
+        is_charging = true;  /* 电量回升超过2% = 充电 */
+    }
+
+    s_prev_pct = app->battery_pct;
+
+    if (is_charging) {
+        /* 充电中: 用插电前的电量作为起始值, 充满才跳100% */
+        if (s_chg_reported < 0) {
+            s_chg_reported = (s_prev_pct >= 0) ? s_prev_pct : app->battery_pct;
+        }
         if (app->battery_pct >= 98) s_chg_reported = 100;
         app->bat_charge_pct = (s_chg_reported > 100) ? 100 : s_chg_reported;
         app->bat_drop_per_h = -1;
@@ -287,6 +306,10 @@ static void api_task(void *pv)
         if (wifi_ok && now - last_fund >= pdMS_TO_TICKS(FUND_REFRESH_SEC * 1000)) {
             last_fund = now;
             FundItem_t tf[MAX_FUNDS];
+            /* 先拷贝旧数据, 失败的基金保留旧净值 */
+            taskENTER_CRITICAL(&s_data_lock);
+            memcpy(tf, g_app_data.funds, sizeof(tf));
+            taskEXIT_CRITICAL(&s_data_lock);
             int tc = 0;
             if (api_fetch_funds(tf, &tc) == ESP_OK) {
                 taskENTER_CRITICAL(&s_data_lock);
@@ -455,6 +478,14 @@ extern "C" void app_main(void)
 
     /* 3. 初始化 I2C (SHTC3 + RTC) */
     i2c_master_init();
+
+    /* 立即读取一次 SHTC3 作为室温基准 (芯片还没发热) */
+    {
+        float t0 = 0, h0 = 0;
+        if (shtc3_read(&t0, &h0) == ESP_OK) {
+            shtc3_set_baseline(t0);
+        }
+    }
 
     /* 4. 初始化 UI */
     if (Lvgl_lock(-1)) {

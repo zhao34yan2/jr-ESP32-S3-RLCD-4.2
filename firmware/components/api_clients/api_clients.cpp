@@ -235,27 +235,36 @@ esp_err_t api_fetch_gold(GoldData_t *out)
 static char *https_get(const char *url, const char *header_key, const char *header_val)
 {
     esp_http_client_config_t cfg = {0};
-    cfg.url = url; cfg.timeout_ms = 5000; cfg.buffer_size = 4096;
+    cfg.url = url; cfg.timeout_ms = 10000; cfg.buffer_size = 16384;
     cfg.skip_cert_common_name_check = true;
+    ESP_LOGI(TAG, "HTTPS connecting: %.50s", url);
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) return NULL;
     if (header_key && header_val) {
         esp_http_client_set_header(client, header_key, header_val);
     }
-    char *buf = (char *)malloc(4096);
+    char *buf = (char *)malloc(16384);
     if (!buf) { esp_http_client_cleanup(client); return NULL; }
-    memset(buf, 0, 4096);
-    esp_err_t err = esp_http_client_perform(client);
+    memset(buf, 0, 16384);
+    esp_err_t err = esp_http_client_open(client, 0);
     if (err == ESP_OK) {
-        int len = esp_http_client_read(client, buf, 4095);
-        if (len > 0) buf[len] = '\0';
+        int cl = esp_http_client_fetch_headers(client);
+        int total = 0, n;
+        while (total < 16383 && (n = esp_http_client_read(client, buf + total, 16383 - total)) > 0) {
+            total += n;
+        }
+        buf[total] = '\0';
+        ESP_LOGI(TAG, "HTTPS OK: %s (%d bytes, cl=%d)", url, total, cl);
     } else {
         ESP_LOGW(TAG, "HTTPS fail: %s (%s)", url, esp_err_to_name(err));
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    if (err != ESP_OK || buf[0] == '\0') {
+        ESP_LOGW(TAG, "HTTPS no data: %s", url);
         free(buf);
-        esp_http_client_cleanup(client);
         return NULL;
     }
-    esp_http_client_cleanup(client);
     return buf;
 }
 
@@ -303,6 +312,63 @@ esp_err_t api_fetch_funds(FundItem_t *funds, int *count)
                 }
             }
             free(resp);
+        }
+
+        /* Fallback: East Money HTTPS (流式解析, 取最后一个 y 值) */
+        if (f->nav < 0.01f) {
+            char emurl[128];
+            snprintf(emurl, sizeof(emurl),
+                     "https://fund.eastmoney.com/pingzhongdata/%s.js", s_fund_codes[i]);
+            ESP_LOGI(TAG, "EM streaming: %s", s_fund_codes[i]);
+            float nav = 0;
+            esp_http_client_config_t cfg = {0};
+            cfg.url = emurl; cfg.timeout_ms = 10000;
+            cfg.skip_cert_common_name_check = true;
+            esp_http_client_handle_t c = esp_http_client_init(&cfg);
+            if (c && esp_http_client_open(c, 0) == ESP_OK) {
+                esp_http_client_fetch_headers(c);
+                char buf[256];
+                int depth = 0;
+                int in_trend = 0;
+                while (1) {
+                    int n = esp_http_client_read(c, buf, sizeof(buf) - 1);
+                    if (n <= 0) break;
+                    buf[n] = '\0';
+                    char *p = buf;
+                    while (*p) {
+                        if (!in_trend) {
+                            if (strncmp(p, "Data_netWorthTrend", 18) == 0) {
+                                in_trend = 1;
+                                p += 18;
+                                continue;
+                            }
+                        } else {
+                            if (depth > 0 || *p == '[') {
+                                if (*p == '[') depth++;
+                                else if (*p == ']') { depth--; if (depth == 0) break; }
+                                else if (strncmp(p, "\"y\":", 4) == 0) {
+                                    p += 4;
+                                    while (*p == ' ') p++;
+                                    nav = (float)atof(p);
+                                    continue;
+                                }
+                            }
+                        }
+                        p++;
+                    }
+                    if (depth == 0 && in_trend) break;  /* 数组已读完 */
+                }
+                esp_http_client_close(c);
+                esp_http_client_cleanup(c);
+            } else if (c) {
+                esp_http_client_cleanup(c);
+            }
+            if (nav > 0.001f) {
+                f->nav = nav;
+                got++;
+                ESP_LOGI(TAG, "Fund %s EM: %.4f", s_fund_codes[i], nav);
+                continue;
+            }
         }
 
         /* Fallback to Bridge */
@@ -374,35 +440,42 @@ void set_bridge_url(const char *url)
     }
 }
 
-/* ===== DeepSeek 直连 (HTTPS, 不依赖 Bridge) ===== */
+/* ===== DeepSeek: 直连 HTTPS, 回退 Bridge ===== */
 esp_err_t api_fetch_deepseek(DeepSeekData_t *out)
 {
-    char *resp = http_get(get_bridge_url());
+    /* 尝试直连 DeepSeek API */
+    char auth[128];
+    snprintf(auth, sizeof(auth), "Bearer %s", DEEPSEEK_API_KEY);
+    char *resp = https_get("https://api.deepseek.com/user/balance", "Authorization", auth);
+    if (resp) {
+        cJSON *root = cJSON_Parse(resp); free(resp);
+        if (root) {
+            cJSON *infos = cJSON_GetObjectItem(root, "balance_infos");
+            if (infos && cJSON_IsArray(infos) && cJSON_GetArraySize(infos) > 0) {
+                cJSON *info = cJSON_GetArrayItem(infos, 0);
+                cJSON *tb = cJSON_GetObjectItem(info, "total_balance");
+                if (tb && tb->valuestring) out->balance = (float)atof(tb->valuestring);
+            }
+            cJSON_Delete(root);
+            ESP_LOGI(TAG, "DS direct: %.2f", out->balance);
+            return ESP_OK;
+        }
+    }
+
+    /* 回退 Bridge */
+    resp = http_get(get_bridge_url());
     if (!resp) return ESP_FAIL;
     cJSON *root = cJSON_Parse(resp); free(resp);
     if (!root) return ESP_FAIL;
-
-    /* Bridge 格式 (有 today_tokens) */
-    cJSON *tt = cJSON_GetObjectItem(root, "today_tokens");
-    if (tt) {
-        out->today_tokens_m = (float)tt->valuedouble / 1e6f;
-        cJSON *i;
-        if ((i = cJSON_GetObjectItem(root, "balance")))     out->balance      = (float)i->valuedouble;
-        if ((i = cJSON_GetObjectItem(root, "today_cost"))) out->today_cost    = (float)i->valuedouble;
-        if ((i = cJSON_GetObjectItem(root, "month_tokens")))out->month_tokens_m=(float)i->valuedouble/1e6f;
-        if ((i = cJSON_GetObjectItem(root, "month_cost")))  out->month_cost   = (float)i->valuedouble;
-        if ((i = cJSON_GetObjectItem(root, "cache_hit_rate")))out->cache_hit_rate=(float)i->valuedouble;
-    } else {
-        /* DeepSeek 官方 API 格式 */
-        cJSON *infos = cJSON_GetObjectItem(root, "balance_infos");
-        if (infos && cJSON_IsArray(infos) && cJSON_GetArraySize(infos) > 0) {
-            cJSON *info = cJSON_GetArrayItem(infos, 0);
-            cJSON *tb = cJSON_GetObjectItem(info, "total_balance");
-            if (tb && tb->valuestring) out->balance = (float)atof(tb->valuestring);
-        }
-    }
+    cJSON *i;
+    if ((i = cJSON_GetObjectItem(root, "balance")))       out->balance      = (float)i->valuedouble;
+    if ((i = cJSON_GetObjectItem(root, "today_tokens")))  out->today_tokens_m = (float)i->valuedouble / 1e6f;
+    if ((i = cJSON_GetObjectItem(root, "today_cost")))    out->today_cost    = (float)i->valuedouble;
+    if ((i = cJSON_GetObjectItem(root, "month_tokens")))  out->month_tokens_m = (float)i->valuedouble / 1e6f;
+    if ((i = cJSON_GetObjectItem(root, "month_cost")))    out->month_cost   = (float)i->valuedouble;
+    if ((i = cJSON_GetObjectItem(root, "cache_hit_rate")))out->cache_hit_rate = (float)i->valuedouble;
     cJSON_Delete(root);
-    ESP_LOGI(TAG, "DS: %.2f", out->balance);
+    ESP_LOGI(TAG, "DS bridge: %.2f", out->balance);
     return ESP_OK;
 }
 

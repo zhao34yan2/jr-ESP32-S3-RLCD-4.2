@@ -321,10 +321,15 @@ void ui_update_all(const AppData_t *app)
 
     /* 室外天气 — 显示城市南京 */
     if (app->weather.condition[0] != '\0' && app->weather.temp_max > 0.5f) {
-        snprintf(buf, sizeof(buf), "南京 %s %.0f~%.0f°C",
+        snprintf(buf, sizeof(buf), "南京.%s %.0f-%.0fC",
                  app->weather.condition,
                  app->weather.temp_min,
                  app->weather.temp_max);
+        ESP_LOGI(TAG, "Weather line: '%s' hex=%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                 buf,
+                 (uint8_t)buf[0],(uint8_t)buf[1],(uint8_t)buf[2],
+                 (uint8_t)buf[3],(uint8_t)buf[4],(uint8_t)buf[5],
+                 (uint8_t)buf[6],(uint8_t)buf[7],(uint8_t)buf[8]);
     } else {
         snprintf(buf, sizeof(buf), "-- ~--°C");
     }

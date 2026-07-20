@@ -8,6 +8,7 @@
 #include "shtc3.h"
 
 static const char *TAG = "SHTC3";
+static float s_ambient = 0;  /* 室温基准 (开机早期设定) */
 
 /* SHTC3 命令 */
 #define SHTC3_CMD_WAKEUP      0x3517
@@ -82,11 +83,14 @@ esp_err_t shtc3_read(float *temperature, float *humidity)
 
     *humidity    = 100.0f * raw_hum / 65536.0f;
     *temperature = -45.0f + 175.0f * raw_temp / 65536.0f;
-    /* 板载 SHTC3 靠近 ESP32 芯片, 减去芯片发热补偿 (~35°C) */
-    *temperature -= 35.0f;
 
-    /* 合理性检测: 室温应该在 0~60°C 之间 */
-    if (*temperature < 0 || *temperature > 60 || *humidity < 0 || *humidity > 100) {
+    /* 芯片发热补偿: 高于基准的降回基准 (由 shtc3_set_baseline 设定) */
+    if (s_ambient > 0.5f && *temperature > s_ambient) {
+        *temperature = s_ambient;
+    }
+
+    /* 合理性检测 */
+    if (*temperature < 0 || *temperature > 70 || *humidity < 0 || *humidity > 100) {
         ESP_LOGW(TAG, "Bad reading: %.1fC %.1f%%RH", *temperature, *humidity);
         return ESP_FAIL;
     }
@@ -97,4 +101,11 @@ esp_err_t shtc3_read(float *temperature, float *humidity)
     shtc3_write_cmd(SHTC3_CMD_SLEEP);
 
     return ESP_OK;
+}
+
+/* 设置室温基准 (app_main 在 WiFi 启动前调用) */
+void shtc3_set_baseline(float temp_c)
+{
+    s_ambient = temp_c;
+    ESP_LOGI(TAG, "Baseline set: %.1fC", temp_c);
 }
