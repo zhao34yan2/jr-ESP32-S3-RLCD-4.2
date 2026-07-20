@@ -23,6 +23,8 @@
 #include <esp_wifi.h>
 
 #include <esp_adc/adc_oneshot.h>
+#include <wifi_provisioning/manager.h>
+#include <wifi_provisioning/scheme_softap.h>
 #include "display_bsp.h"
 #include "lvgl_bsp.h"
 #include "user_config.h"
@@ -409,6 +411,64 @@ static void ui_task(void *pv)
     }
 }
 
+/* ===== WiFi 配网 (手机端配置) ===== */
+static void prov_event_handler(void *arg, wifi_prov_cb_event_t event, void *data)
+{
+    switch (event) {
+        case WIFI_PROV_CRED_RECV:
+            ESP_LOGI(TAG, "Provisioning: credentials received");
+            break;
+        case WIFI_PROV_CRED_FAIL:
+            ESP_LOGW(TAG, "Provisioning: credentials failed");
+            wifi_prov_mgr_reset_provisioning();
+            break;
+        case WIFI_PROV_CRED_SUCCESS:
+            ESP_LOGI(TAG, "Provisioning: success, restarting...");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            esp_restart();
+            break;
+        default:
+            break;
+    }
+}
+
+static void start_provisioning(void)
+{
+    ESP_LOGI(TAG, "Starting WiFi provisioning (AP: PROV_RLCD)");
+
+    /* 初始化配置 */
+    wifi_prov_mgr_config_t cfg = {
+        .scheme = wifi_prov_scheme_softap,
+        .scheme_event_handler = WIFI_PROV_EVENT_HANDLER_NONE,
+        .app_event_handler = {
+            .event_cb = prov_event_handler,
+            .user_data = NULL
+        },
+    };
+    ESP_ERROR_CHECK(wifi_prov_mgr_init(cfg));
+
+    /* 检查是否已配过网 */
+    bool provisioned = false;
+    ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));
+    if (provisioned) {
+        ESP_LOGI(TAG, "Already provisioned, connecting...");
+        wifi_prov_mgr_deinit();
+        return;
+    }
+
+    /* 启动配网 (AP 热点, 无密码, 超时 5 分钟) */
+    const char *service_name = "PROV_RLCD";
+    ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(
+        WIFI_PROV_SECURITY_0, NULL, service_name, NULL));
+
+    /* 等待配网完成 (最长 5 分钟) */
+    wifi_prov_mgr_wait();
+    wifi_prov_mgr_deinit();
+    ESP_LOGI(TAG, "Provisioning timeout, restarting...");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+}
+
 /* ===== 主入口 ===== */
 /* ===== Bridge UDP 自动发现 ===== */
 static void bridge_discovery_task(void *pv)
@@ -505,7 +565,7 @@ extern "C" void app_main(void)
     gpio_config(&io_conf);
     g_key_last = gpio_get_level(KEY_GPIO);
 
-    /* 5. 连接 WiFi + NTP 同步 */
+    /* 5. 连接 WiFi + NTP 同步 (失败则进手机配网) */
     wifi_init_sta(WIFI_SSID, WIFI_PASSWORD);
     if (wifi_wait_connected(15000) == ESP_OK) {
         ESP_LOGI(TAG, "WiFi connected, syncing NTP...");
@@ -514,7 +574,8 @@ extern "C" void app_main(void)
         tzset();
         ESP_LOGI(TAG, "Timezone set to CST-8 (China)");
     } else {
-        ESP_LOGW(TAG, "WiFi connection timeout, will retry later");
+        ESP_LOGW(TAG, "WiFi connection timeout, starting provisioning...");
+        start_provisioning();
     }
 
     /* 6. 初始化仪表盘页面 */
