@@ -68,8 +68,6 @@ static lv_obj_t *fund_labels[MAX_FUNDS][3]; /* [i][0]=name, [1]=nav, [2]=chg */
 static int       fund_count = 0;
 static const char *fund_names[MAX_FUNDS] = {"摩根日本精选股票(QDII)A","摩根纳斯达克100指数(QDII)","广发全球精选股票(QDII)"};
 static lv_obj_t *ui_ds_balance;
-static lv_obj_t *ui_ds_cache;
-static lv_obj_t *ds_line2_v1, *ds_line2_v2;
 /* footer removed */
 
 /* ===== 状态栏 ===== */
@@ -235,33 +233,13 @@ static void create_ds_section(lv_obj_t *parent)
     lv_obj_set_style_text_font(ds_t, &lv_font_montserrat_12, 0);
     lv_obj_align(ds_t, LV_ALIGN_TOP_LEFT, 4, y + 1);
 
-    /* 第2行: 余额 + cache */
+    /* 第2行: 余额 (真实数据, 其他为假数据已移除) */
     ui_ds_balance = lv_label_create(parent);
     lv_label_set_text(ui_ds_balance, "余额 --.--");
     lv_obj_set_width(ui_ds_balance, 140);
     lv_obj_set_style_text_color(ui_ds_balance, C_BLACK, 0);
     lv_obj_set_style_text_font(ui_ds_balance, &*FONT_CN, 0);
     lv_obj_align(ui_ds_balance, LV_ALIGN_TOP_LEFT, 4, y + 14);
-
-    ui_ds_cache = lv_label_create(parent);
-    lv_label_set_text(ui_ds_cache, "命中率cache--%");
-    lv_obj_set_style_text_color(ui_ds_cache, C_BLACK, 0);
-    lv_obj_set_style_text_font(ui_ds_cache, &*FONT_CN, 0);
-    lv_obj_align(ui_ds_cache, LV_ALIGN_TOP_LEFT, 200, y + 14);
-
-    /* 第3行: 消耗token */
-    int r3 = y + 28;
-    ds_line2_v1 = lv_label_create(parent);
-    lv_label_set_text(ds_line2_v1, "今日消耗token--");
-    lv_obj_set_style_text_color(ds_line2_v1, C_BLACK, 0);
-    lv_obj_set_style_text_font(ds_line2_v1, &*FONT_CN, 0);
-    lv_obj_align(ds_line2_v1, LV_ALIGN_TOP_LEFT, 4, r3);
-
-    ds_line2_v2 = lv_label_create(parent);
-    lv_label_set_text(ds_line2_v2, "本月消耗token--");
-    lv_obj_set_style_text_color(ds_line2_v2, C_BLACK, 0);
-    lv_obj_set_style_text_font(ds_line2_v2, &*FONT_CN, 0);
-    lv_obj_align(ds_line2_v2, LV_ALIGN_TOP_LEFT, 200, r3);
 
 }
 
@@ -390,12 +368,6 @@ void ui_update_all(const AppData_t *app)
     if (app->ds.balance > 0) {
         snprintf(buf, sizeof(buf), "余额 %.2f", app->ds.balance);
         lv_label_set_text(ui_ds_balance, buf);
-        snprintf(buf, sizeof(buf), "cache %d%%", (int)(app->ds.cache_hit_rate * 100));
-        lv_label_set_text(ui_ds_cache, buf);
-        snprintf(buf, sizeof(buf), "今日消耗token%.0fM", app->ds.today_tokens_m);
-        lv_label_set_text(ds_line2_v1, buf);
-        snprintf(buf, sizeof(buf), "本月消耗token%.0fM", app->ds.month_tokens_m);
-        lv_label_set_text(ds_line2_v2, buf);
     }
 
 }

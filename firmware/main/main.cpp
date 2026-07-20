@@ -483,7 +483,7 @@ extern "C" void app_main(void)
     {
         float t0 = 0, h0 = 0;
         if (shtc3_read(&t0, &h0) == ESP_OK) {
-            shtc3_set_baseline(t0);
+            shtc3_set_baseline(t0 - 20.0f);  /* 首次读数减去芯片起始发热 */
         }
     }
 
