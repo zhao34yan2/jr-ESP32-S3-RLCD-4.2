@@ -5,10 +5,20 @@
 
 #include <cstring>
 #include <esp_log.h>
+#include <esp_timer.h>
+#include <esp_system.h>
 #include "shtc3.h"
 
 static const char *TAG = "SHTC3";
-static float s_ambient = 0;  /* 室温基准 (开机早期设定) */
+
+/* 芯片自热补偿: 传感器与主板同 PCB, 热平衡后读数稳定偏高.
+ * 真实室温 = 传感器读数 + TEMP_OFFSET (标定值, 需实测微调).
+ * 标定方法: 设备运行满 20 分钟热平衡后, 用准确温度计对比,
+ *           TEMP_OFFSET = 真实室温 - 设备显示. */
+static float s_temp_offset = -23.0f;
+
+/* 热平衡时间(秒): 冷启动补偿从 0 渐进到满偏移的时长 (与上面 20 分钟标定条件一致) */
+#define SHTC3_WARMUP_SEC (20 * 60)
 
 /* SHTC3 命令 */
 #define SHTC3_CMD_WAKEUP      0x3517
@@ -84,18 +94,27 @@ esp_err_t shtc3_read(float *temperature, float *humidity)
     *humidity    = 100.0f * raw_hum / 65536.0f;
     *temperature = -45.0f + 175.0f * raw_temp / 65536.0f;
 
-    /* 芯片发热补偿: 高于基准的降回基准 (由 shtc3_set_baseline 设定) */
-    if (s_ambient > 0.5f && *temperature > s_ambient) {
-        *temperature = s_ambient;
-    }
-
-    /* 合理性检测 */
+    /* 合理性检测 (用原始读数判断, 补偿前) */
     if (*temperature < 0 || *temperature > 70 || *humidity < 0 || *humidity > 100) {
         ESP_LOGW(TAG, "Bad reading: %.1fC %.1f%%RH", *temperature, *humidity);
         return ESP_FAIL;
     }
 
+    /* 芯片自热补偿:
+     * 平衡态自热恒为 |s_temp_offset| (由硬件功耗决定, 标定得到).
+     * 只有"冷上电"后约 SHTC3_WARMUP_SEC 内芯片仍在升温, 此时按开机时间线性渐进,
+     * 避免刚上电就减满偏移得到荒谬低温/负温.
+     * 软重启(如配网后 esp_restart)/panic/看门狗复位时板子已热平衡, 立即用满偏移不再渐进
+     * —— 用复位原因区分冷/热启动, 避免热重启后 20 分钟内温度显示偏高. */
+    float eff_offset = s_temp_offset;
+    if (esp_reset_reason() == ESP_RST_POWERON) {
+        int64_t up_s = esp_timer_get_time() / 1000000;
+        if (up_s < SHTC3_WARMUP_SEC) {
+            eff_offset = s_temp_offset * (float)up_s / (float)SHTC3_WARMUP_SEC;
+        }
+    }
 
+    *temperature += eff_offset;
 
     /* 休眠 */
     shtc3_write_cmd(SHTC3_CMD_SLEEP);
@@ -103,9 +122,9 @@ esp_err_t shtc3_read(float *temperature, float *humidity)
     return ESP_OK;
 }
 
-/* 设置室温基准 (app_main 在 WiFi 启动前调用) */
-void shtc3_set_baseline(float temp_c)
+/* 运行时设置自热偏移 (标定用): 真实室温 = 显示 + offset */
+void shtc3_set_temp_offset(float offset_c)
 {
-    s_ambient = temp_c;
-    ESP_LOGI(TAG, "Baseline set: %.1fC", temp_c);
+    s_temp_offset = offset_c;
+    ESP_LOGI(TAG, "Temp offset set: %.1fC", offset_c);
 }

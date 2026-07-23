@@ -29,10 +29,10 @@ void i2c_master_init(void);
 esp_err_t shtc3_read(float *temperature, float *humidity);
 
 /**
- * @brief 设置室温基准 (开机早期调用, 芯片还没发热)
- * @param temp_c 首次读取的原始温度值
+ * @brief 设置芯片自热补偿偏移 (真实室温 = 传感器读数 + offset)
+ * @param offset_c 偏移量 (°C), 通常为负值; 热平衡后实测标定
  */
-void shtc3_set_baseline(float temp_c);
+void shtc3_set_temp_offset(float offset_c);
 
 #ifdef __cplusplus
 }

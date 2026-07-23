@@ -128,6 +128,15 @@ void dashboard_create(void)
     ESP_LOGI(TAG, "4-grid (custom_font_14_big)");
 }
 
+/* 仅在文本变化时才 set, 避免无谓 invalidate → 整屏重绘 (反射屏静止时零刷新) */
+static void set_label(lv_obj_t *l, const char *txt)
+{
+    if (!l) return;
+    const char *cur = lv_label_get_text(l);
+    if (cur && strcmp(cur, txt) == 0) return;
+    lv_label_set_text(l, txt);
+}
+
 /* ===== 更新 ===== */
 void dashboard_update(const AppData_t *app)
 {
@@ -139,26 +148,26 @@ void dashboard_update(const AppData_t *app)
 
     /* 天气卡 */
     snprintf(b, sizeof b, "%04d/%02d/%02d", ti.tm_year+1900, ti.tm_mon+1, ti.tm_mday);
-    lv_label_set_text(l_date, b);
+    set_label(l_date, b);
     static const char *wd[] = {"日","一","二","三","四","五","六"};
     snprintf(b, sizeof b, "星期%s", wd[ti.tm_wday]);
-    lv_label_set_text(l_wkd, b);
-    if (app->weather.condition[0]) lv_label_set_text(l_cond, app->weather.condition);
-    if (app->weather.temp_max > 0.5f) {
+    set_label(l_wkd, b);
+    if (app->weather.condition[0]) {  /* 有数据即显示, 避免冬天低温被温度阈值误判 */
+        set_label(l_cond, app->weather.condition);
         snprintf(b, sizeof b, "%.0f-%.0fC", app->weather.temp_min, app->weather.temp_max);
-        lv_label_set_text(l_temp, b);
+        set_label(l_temp, b);
     }
-    lv_label_set_text(l_city, WEATHER_CITY);
+    set_label(l_city, WEATHER_CITY);
 
     /* 室内卡 */
     snprintf(b, sizeof b, "温度: %.1fC", app->indoor_temp);
-    lv_label_set_text(l_itemp, b);
+    set_label(l_itemp, b);
     snprintf(b, sizeof b, "湿度: %d%%", (int)app->indoor_hum);
-    lv_label_set_text(l_ihum, b);
+    set_label(l_ihum, b);
     snprintf(b, sizeof b, "电池: %d%%", app->battery_pct);
-    lv_label_set_text(l_ibat, b);
+    set_label(l_ibat, b);
     snprintf(b, sizeof b, "WiFi: %s", wifi_is_connected() ? "OK" : "NO");
-    lv_label_set_text(l_iwifi, b);
+    set_label(l_iwifi, b);
 
     /* 预报卡 */
     int nd = app->weather.fc_count > 3 ? 3 : app->weather.fc_count;
@@ -170,11 +179,7 @@ void dashboard_update(const AppData_t *app)
                  fd.tm_mon+1, fd.tm_mday,
                  app->weather.fc_cond[i],
                  app->weather.fc_min[i], app->weather.fc_max[i]);
-        ESP_LOGI(TAG, "FC show[%d]: '%s' hex=%02x%02x%02x%02x%02x%02x",
-                 i, b,
-                 (uint8_t)b[0], (uint8_t)b[1], (uint8_t)b[2],
-                 (uint8_t)b[3], (uint8_t)b[4], (uint8_t)b[5]);
-        lv_label_set_text(l_fc[i], b);
+        set_label(l_fc[i], b);
     }
 
     /* 设备卡 — 简洁监控 */
@@ -190,12 +195,12 @@ void dashboard_update(const AppData_t *app)
 
         snprintf(b, sizeof b, "CPU: %dMHz  Free:%d%%",
                  CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ, pct);
-        lv_label_set_text(l_d1, b);
+        set_label(l_d1, b);
 
         size_t r_used = r_total - r_free;
         snprintf(b, sizeof b, "RAM: %.1f/%.1fM",
                  (double)r_used / (1024*1024), (double)r_total / (1024*1024));
-        lv_label_set_text(l_d2, b);
+        set_label(l_d2, b);
 
         /* 电量趋势 (替代PSRAM行) */
         if (app->bat_log_count < 2) {
@@ -208,12 +213,12 @@ void dashboard_update(const AppData_t *app)
         } else {
             snprintf(b, sizeof b, "电耗:--%%/h");
         }
-        lv_label_set_text(l_d3, b);
+        set_label(l_d3, b);
 
         uint64_t us = esp_timer_get_time();
         snprintf(b, sizeof b, "Up: %uh%02um",
                  (unsigned)(us/3600000000ULL), (unsigned)((us%3600000000ULL)/60000000ULL));
-        lv_label_set_text(l_d4, b);
+        set_label(l_d4, b);
     }
 
 }

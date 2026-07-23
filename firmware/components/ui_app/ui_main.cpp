@@ -43,6 +43,16 @@ static const char *TAG = "UI";
 #define C_BLACK  lv_color_black()
 #define C_WHITE  lv_color_white()
 
+/* 仅在文本变化时才 set: lv_label_set_text 不比较内容, 每次都 invalidate 触发整屏重绘.
+ * 用 LVGL 自存的当前文本做比较, 内容不变则跳过, 屏幕静止时零重绘 (省电/防闪). */
+static void set_label(lv_obj_t *l, const char *txt)
+{
+    if (!l) return;
+    const char *cur = lv_label_get_text(l);
+    if (cur && strcmp(cur, txt) == 0) return;
+    lv_label_set_text(l, txt);
+}
+
 /* 布局常量 */
 #define SCREEN_W     400
 #define SCREEN_H     300
@@ -266,16 +276,16 @@ void ui_update_all(const AppData_t *app)
 
     /* 状态栏 */
     get_time_str(buf);
-    lv_label_set_text(ui_status_time, buf);
+    set_label(ui_status_time, buf);
 
     /* 电池 */
     if (ui_battery) {
         if (app->bat_drop_per_h < 0) {
             snprintf(buf, sizeof(buf), "充电 %d%%", app->bat_charge_pct);
-            lv_label_set_text(ui_battery, buf);
+            set_label(ui_battery, buf);
         } else {
             snprintf(buf, sizeof(buf), "电量 %d%%", app->battery_pct);
-            lv_label_set_text(ui_battery, buf);
+            set_label(ui_battery, buf);
         }
     }
 
@@ -292,43 +302,38 @@ void ui_update_all(const AppData_t *app)
              ti.tm_mon + 1, ti.tm_mday,
              "星期",
              wday_cn[ti.tm_wday]);
-    lv_label_set_text(ui_status_date, date_buf);
+    set_label(ui_status_date, date_buf);
 
-    /* 室外天气 — 显示城市南京 */
-    if (app->weather.condition[0] != '\0' && app->weather.temp_max > 0.5f) {
+    /* 室外天气 — 显示城市南京 (有天气数据即显示, 不能用温度阈值判断, 否则冬天 ≤0.5°C 会被误判为无数据) */
+    if (app->weather.condition[0] != '\0') {
         snprintf(buf, sizeof(buf), "南京.%s %.0f-%.0fC",
                  app->weather.condition,
                  app->weather.temp_min,
                  app->weather.temp_max);
-        ESP_LOGI(TAG, "Weather line: '%s' hex=%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-                 buf,
-                 (uint8_t)buf[0],(uint8_t)buf[1],(uint8_t)buf[2],
-                 (uint8_t)buf[3],(uint8_t)buf[4],(uint8_t)buf[5],
-                 (uint8_t)buf[6],(uint8_t)buf[7],(uint8_t)buf[8]);
     } else {
         snprintf(buf, sizeof(buf), "-- ~--°C");
     }
-    lv_label_set_text(ui_weather_text, buf);
+    set_label(ui_weather_text, buf);
 
     /* 室内温湿度 + PM2.5 */
     snprintf(buf, sizeof(buf), "室内%.1f°C 湿度%d%%RH PM%d",
              app->indoor_temp, (int)app->indoor_hum,
              app->weather.pm25 > 0 ? app->weather.pm25 : 35);
-    lv_label_set_text(ui_weather_indoor, buf);
+    set_label(ui_weather_indoor, buf);
 
     /* 黄金 */
     if (app->gold.price > 1) {
         snprintf(buf, sizeof(buf), "黄金 %.2f 元/克", app->gold.price);
-        lv_label_set_text(ui_gold_text, buf);
+        set_label(ui_gold_text, buf);
         if (app->gold.high > 1 || app->gold.low > 1) {
             snprintf(buf, sizeof(buf), "低%.2f 高%.2f", app->gold.low, app->gold.high);
         } else {
             snprintf(buf, sizeof(buf), "---");
         }
-        lv_label_set_text(ui_gold_change, buf);
+        set_label(ui_gold_change, buf);
     } else {
-        lv_label_set_text(ui_gold_text, "黄金 --- 元/克");
-        lv_label_set_text(ui_gold_change, "等待联网...");
+        set_label(ui_gold_text, "黄金 --- 元/克");
+        set_label(ui_gold_change, "等待联网...");
     }
 
     /* 白银已移除 */
@@ -346,18 +351,18 @@ void ui_update_all(const AppData_t *app)
             /* 去掉尾部的"人民币A"节省空间 */
             char *rmb = strstr(name, "人民币A");
             if (rmb) *rmb = '\0';
-            lv_label_set_text(fund_labels[i][0], name);
+            set_label(fund_labels[i][0], name);
 
             snprintf(buf, sizeof(buf), "%.4f", f->nav);
-            lv_label_set_text(fund_labels[i][1], buf);
+            set_label(fund_labels[i][1], buf);
 
             snprintf(buf, sizeof(buf), "%s%.2f%%",
                      f->is_up ? "▲" : "▼", f->change_pct);
-            lv_label_set_text(fund_labels[i][2], buf);
+            set_label(fund_labels[i][2], buf);
         } else {
-            lv_label_set_text(fund_labels[i][0], fund_names[i] ? fund_names[i] : "-");
-            lv_label_set_text(fund_labels[i][1], "--");
-            lv_label_set_text(fund_labels[i][2], "--");
+            set_label(fund_labels[i][0], fund_names[i] ? fund_names[i] : "-");
+            set_label(fund_labels[i][1], "--");
+            set_label(fund_labels[i][2], "--");
         }
     }  /* for fund_count */
 

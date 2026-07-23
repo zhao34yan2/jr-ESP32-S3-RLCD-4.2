@@ -11,3 +11,8 @@ scripts/custom_font_*.c
 scripts/node.exe
 *.bin
 *.log
+# 本地工具 (含本机绝对路径/串口号, 不入库)
+.vscode/
+firmware/_build_tmp.bat
+firmware/_flash_tmp.bat
+firmware/_monitor_tmp.bat

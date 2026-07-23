@@ -22,15 +22,23 @@ static const char *TAG = "NET";
 static EventGroupHandle_t s_wifi_event_group;
 static const int WIFI_CONNECTED_BIT = BIT0;
 static int s_retry_count = 0;
+/* STA 自动重连开关: 进 AP 配网前置 false, 避免重连与 WiFi 扫描抢射频 */
+static volatile bool s_reconnect_enabled = true;
 
 /* ===== WiFi 事件处理 ===== */
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        if (s_reconnect_enabled) esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_count < 5) {
+        /* 打印断连原因码, 用于区分网络问题(找不到AP)还是配置问题(密码错) */
+        wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
+        ESP_LOGW(TAG, "STA disconnected, reason=%d", d ? d->reason : -1);
+        if (!s_reconnect_enabled) {
+            /* 配网模式: 不再重连, 让射频空出来给扫描 */
+            xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        } else if (s_retry_count < 5) {
             esp_wifi_connect();
             s_retry_count++;
             ESP_LOGW(TAG, "WiFi disconnect, retry %d", s_retry_count);
@@ -66,7 +74,9 @@ void wifi_init_sta(const char *ssid, const char *password)
     wifi_config_t wifi_config = {0};
     strlcpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
     strlcpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    /* 有密码要求至少 WPA2; 空密码则设 OPEN, 否则连开放热点会被阈值拒绝 */
+    wifi_config.sta.threshold.authmode =
+        (password && password[0]) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     wifi_config.sta.pmf_cfg.capable = true;
     wifi_config.sta.pmf_cfg.required = false;
 
@@ -91,16 +101,45 @@ bool wifi_is_connected(void)
 
 void wifi_check_reconnect(void)
 {
+    if (!s_reconnect_enabled) return;  /* 配网模式下不重连 */
     if (!wifi_is_connected()) {
         static uint32_t last_try = 0;
         uint32_t now = xTaskGetTickCount() / pdMS_TO_TICKS(1000);
-        if (now - last_try > 600) {  /* 每10分钟尝试重连一次 */
+        if (now - last_try > 120) {  /* 每2分钟尝试重连一次 */
             last_try = now;
             s_retry_count = 0;
             ESP_LOGW(TAG, "WiFi auto reconnect...");
             esp_wifi_connect();
         }
     }
+}
+
+/* 停止 STA 自动重连并断开当前连接 (进 AP 配网前调用, 释放射频给扫描) */
+void wifi_stop_sta_reconnect(void)
+{
+    s_reconnect_enabled = false;
+    s_retry_count = 99;  /* 防止事件处理里再触发重连 */
+    esp_wifi_disconnect();
+    ESP_LOGI(TAG, "STA reconnect disabled (for provisioning scan)");
+}
+
+/* 切换到另一个网络 (WiFi 驱动已初始化后调用, 不重建驱动/事件循环)
+ * 用于开机先试主网络失败后, 不解初始化直接切到备用网络再试 */
+void wifi_switch_network(const char *ssid, const char *password)
+{
+    wifi_config_t wc = {0};
+    strlcpy((char *)wc.sta.ssid,     ssid,     sizeof(wc.sta.ssid));
+    strlcpy((char *)wc.sta.password, password, sizeof(wc.sta.password));
+    wc.sta.threshold.authmode =
+        (password && password[0]) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    wc.sta.pmf_cfg.capable  = true;
+    wc.sta.pmf_cfg.required = false;
+    s_retry_count = 0;
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    esp_wifi_disconnect();
+    esp_wifi_set_config(WIFI_IF_STA, &wc);
+    esp_wifi_connect();
+    ESP_LOGI(TAG, "Switching to fallback WiFi: %s", ssid);
 }
 
 /* ===== NTP 时间同步 ===== */
@@ -143,7 +182,8 @@ void get_time_str(char *buf)
     struct tm ti = {0};
     time(&now);
     localtime_r(&now, &ti);
-    snprintf(buf, 24, "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec);
+    /* 只到分: 反射屏主界面静止时可降到分钟级刷新, 省电且减少刷屏闪动 */
+    snprintf(buf, 24, "%02d:%02d", ti.tm_hour, ti.tm_min);
 }
 
 void get_date_str(char *buf)

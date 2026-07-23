@@ -102,9 +102,6 @@ esp_err_t api_fetch_funds(FundItem_t *funds, int *count);
 /* Bridge URL 更新标志 (api_task 轮询后重拉基金/DS) */
 extern volatile int g_bridge_url_changed;
 
-/* 数据更新锁 (写前置1, 写后清0, 读前检查) */
-extern volatile int g_data_locked;
-
 /**
  * @brief 获取 DeepSeek 用量 (通过 bridge)
  */

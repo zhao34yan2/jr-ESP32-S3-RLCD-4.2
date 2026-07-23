@@ -28,9 +28,21 @@ esp_err_t wifi_wait_connected(int timeout_ms);
 bool wifi_is_connected(void);
 
 /**
- * @brief WiFi 断线重连检查 (每60秒自动尝试)
+ * @brief WiFi 断线重连检查 (每2分钟自动尝试)
  */
 void wifi_check_reconnect(void);
+
+/**
+ * @brief 停止 STA 自动重连 (进 AP 配网前调用, 避免重连与扫描抢射频)
+ */
+void wifi_stop_sta_reconnect(void);
+
+/**
+ * @brief 切换到另一个网络 (WiFi 已初始化后调用, 不重建驱动)
+ * @param ssid     新 SSID
+ * @param password 新密码 (空串=开放网络)
+ */
+void wifi_switch_network(const char *ssid, const char *password);
 
 /**
  * @brief 同步 NTP 时间

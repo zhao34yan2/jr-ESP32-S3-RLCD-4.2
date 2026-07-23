@@ -12,6 +12,7 @@
 #include <esp_log.h>
 #include <esp_http_client.h>
 #include <esp_crt_bundle.h>
+#include <esp_heap_caps.h>
 #include <nvs_flash.h>
 #include <nvs.h>
 #include <cJSON.h>
@@ -23,9 +24,6 @@ static const char *TAG = "API";
 
 /* Bridge URL 更新标志 — api_task 轮询此标志, 发现变化立即重拉数据 */
 volatile int g_bridge_url_changed = 0;
-
-/* 数据更新锁 */
-volatile int g_data_locked = 0;
 
 /* ===== Default fund codes ===== */
 static const char *s_fund_codes[] = {
@@ -79,13 +77,24 @@ static char *http_get(const char *url)
         path, host);
     write(sock, req, req_len);
 
-    char *buf = (char *)malloc(4096);
+    /* 动态增长缓冲: 初始 8KB, 不足则翻倍, 上限 64KB (放 PSRAM, 省内部 RAM) */
+    size_t cap = 8192;
+    char *buf = (char *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = (char *)malloc(cap);   /* PSRAM 不可用时回退内部 RAM */
     if (!buf) { close(sock); return NULL; }
-    memset(buf, 0, 4096);
     int total = 0, n;
-    while (total < 4095 && (n = read(sock, buf + total, 4095 - total)) > 0) {
+    /* HTTP/1.0 + Connection close: 服务器读完即关闭, read 返回 0 表示结束 */
+    while ((n = read(sock, buf + total, cap - 1 - total)) > 0) {
         total += n;
-        if (total >= 7 && memcmp(buf + total - 5, "\r\n0\r\n", 4) == 0) break;
+        if ((size_t)total >= cap - 1) {
+            if (cap >= 65536) break;   /* 上限保护 */
+            size_t new_cap = cap * 2;
+            char *nb = (char *)heap_caps_realloc(buf, new_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!nb) nb = (char *)realloc(buf, new_cap);
+            if (!nb) break;            /* 扩容失败, 用已有数据 */
+            buf = nb;
+            cap = new_cap;
+        }
     }
     buf[total] = '\0';
     close(sock);
@@ -94,23 +103,37 @@ static char *http_get(const char *url)
     if (body) {
         body += 4;
         int body_len = total - (body - buf);
-        char *result = (char *)malloc(body_len + 1);
+        char *result = (char *)heap_caps_malloc(body_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!result) result = (char *)malloc(body_len + 1);
         if (result) { memcpy(result, body, body_len); result[body_len] = '\0'; free(buf); return result; }
     }
     return buf;
 }
 
-/* ===== Weather code → Chinese ===== */
+/* ===== Weather code → Chinese =====
+ * 按 open-meteo WMO 天气码标准映射; 仅用字体已含的汉字
+ * (晴/阴/雾/雨/中雨/大雨/雪), 雷雨等归入"雨" */
 static const char *code_to_cond(int w)
 {
-    if (w <= 3) return "晴";
-    if (w <= 20) return "阴";
-    if (w <= 50) return "雾";
-    if (w <= 60) return "雨";  /* 小雨→雨 (小字在custom_font渲染有问题) */
-    if (w <= 70) return "中雨";
-    if (w <= 80) return "大雨";
-    if (w <= 86) return "雪";
-    return "雨";
+    switch (w) {
+        case 0: case 1:                 return "晴";   /* 晴 / 大部晴 */
+        case 2: case 3:                 return "阴";   /* 多云 / 阴 */
+        case 45: case 48:               return "雾";   /* 雾 / 雾凇 */
+        case 51: case 53: case 55:      return "雨";   /* 毛毛雨 */
+        case 56: case 57:               return "雨";   /* 冻雨 */
+        case 61:                        return "雨";   /* 小雨 */
+        case 63:                        return "中雨";
+        case 65:                        return "大雨";
+        case 66: case 67:               return "雨";   /* 冻雨 */
+        case 71: case 73: case 75:      return "雪";
+        case 77:                        return "雪";   /* 雪粒 */
+        case 80:                        return "雨";   /* 阵雨 */
+        case 81:                        return "中雨";
+        case 82:                        return "大雨";
+        case 85: case 86:               return "雪";   /* 阵雪 */
+        case 95: case 96: case 99:      return "雨";   /* 雷雨 → 雨 */
+        default:                        return "阴";
+    }
 }
 
 /* ===== Weather (open-meteo) ===== */
@@ -170,15 +193,6 @@ esp_err_t api_fetch_weather(WeatherData_t *out)
                     out->fc_cond[i][j] = src[j];
                     j++;
                 }
-                /* 调试: 打印原始字节 */
-                ESP_LOGI(TAG, "FC[%d]: code=%d raw=%02x%02x%02x%02x%02x%02x",
-                         i, wc,
-                         (uint8_t)out->fc_cond[i][0],
-                         (uint8_t)out->fc_cond[i][1],
-                         (uint8_t)out->fc_cond[i][2],
-                         (uint8_t)out->fc_cond[i][3],
-                         (uint8_t)out->fc_cond[i][4],
-                         (uint8_t)out->fc_cond[i][5]);
                 out->fc_cond[i][j] = '\0';
             }
             out->fc_count++;
@@ -243,7 +257,9 @@ static char *https_get(const char *url, const char *header_key, const char *head
     if (header_key && header_val) {
         esp_http_client_set_header(client, header_key, header_val);
     }
-    char *buf = (char *)malloc(16384);
+    /* 16KB 缓冲放 PSRAM, 避免反复占用内部 RAM 造成碎片 */
+    char *buf = (char *)heap_caps_malloc(16384, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = (char *)malloc(16384);   /* PSRAM 不可用时回退内部 RAM */
     if (!buf) { esp_http_client_cleanup(client); return NULL; }
     memset(buf, 0, 16384);
     esp_err_t err = esp_http_client_open(client, 0);
@@ -293,15 +309,15 @@ esp_err_t api_fetch_funds(FundItem_t *funds, int *count)
                     cJSON *root = cJSON_Parse(p);
                     if (root) {
                         cJSON *item;
-                        if ((item = cJSON_GetObjectItem(root, "name")))
+                        if ((item = cJSON_GetObjectItem(root, "name")) && cJSON_IsString(item))
                             strlcpy(f->name, item->valuestring, sizeof(f->name));
-                        if ((item = cJSON_GetObjectItem(root, "gsz")))
+                        if ((item = cJSON_GetObjectItem(root, "gsz")) && cJSON_IsString(item))
                             f->nav = (float)atof(item->valuestring);
-                        if ((item = cJSON_GetObjectItem(root, "gszzl"))) {
+                        if ((item = cJSON_GetObjectItem(root, "gszzl")) && cJSON_IsString(item)) {
                             f->change_pct = (float)atof(item->valuestring);
                             f->is_up = (f->change_pct >= 0) ? 1 : 0;
                         }
-                        if (f->nav < 0.001f && (item = cJSON_GetObjectItem(root, "dwjz")))
+                        if (f->nav < 0.001f && (item = cJSON_GetObjectItem(root, "dwjz")) && cJSON_IsString(item))
                             f->nav = (float)atof(item->valuestring);
                         cJSON_Delete(root);
                         free(resp);
