@@ -185,11 +185,18 @@ static void create_content_area(lv_obj_t *parent)
     lv_obj_set_style_text_font(h_name, &*FONT_CN, 0);
     lv_obj_align(h_name, LV_ALIGN_TOP_LEFT, rx, fy);
 
+    lv_obj_t *h_nav = lv_label_create(parent);
+    lv_label_set_text(h_nav, "净值");
+    lv_obj_set_style_text_color(h_nav, C_BLACK, 0);
+    lv_obj_set_style_text_font(h_nav, &*FONT_CN, 0);
+    lv_obj_align(h_nav, LV_ALIGN_TOP_LEFT, rx + 220, fy);
+
+    /* 净值日期: 放在"基金"表头右侧的空白区, 自解释, 不挤净值/涨跌列 */
     fund_nav_hdr = lv_label_create(parent);
-    lv_label_set_text(fund_nav_hdr, "净值");
+    lv_label_set_text(fund_nav_hdr, "");
     lv_obj_set_style_text_color(fund_nav_hdr, C_BLACK, 0);
     lv_obj_set_style_text_font(fund_nav_hdr, &*FONT_CN, 0);
-    lv_obj_align(fund_nav_hdr, LV_ALIGN_TOP_LEFT, rx + 220, fy);
+    lv_obj_align(fund_nav_hdr, LV_ALIGN_TOP_LEFT, rx + 70, fy);
 
     lv_obj_t *h_chg = lv_label_create(parent);
     lv_label_set_text(h_chg, "涨跌");
@@ -370,13 +377,13 @@ void ui_update_all(const AppData_t *app)
         }
     }  /* for fund_count */
 
-    /* 净值日期显示在表头 (QDII 为 T-1, 让用户知道是哪天的净值) */
+    /* 净值日期 (QDII 为 T-1/T-2): 显示在"基金"右侧空白区, 自解释 */
     if (fund_nav_hdr) {
         const char *d = "";
         for (int i = 0; i < app->fund_count && i < MAX_FUNDS; i++)
             if (app->funds[i].nav_date[0]) { d = app->funds[i].nav_date; break; }
         if (d[0]) {
-            snprintf(buf, sizeof(buf), "净值 %s", d);
+            snprintf(buf, sizeof(buf), "净值日 %s", d);
             set_label(fund_nav_hdr, buf);
         }
     }
