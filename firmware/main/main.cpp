@@ -235,6 +235,30 @@ static void sensor_task(void *pv)
 }
 
 /* ===== API 轮询任务 ===== */
+/* ===== 夜间省电测试开关 =====
+ * 置 1: 用"分钟奇偶"造快速循环 (偶数分=白天, 奇数分=夜间), 每分钟切换一次,
+ *       烧录后 1~2 分钟即可在串口看到进/出省电全过程, 无需等到 21 点.
+ * 置 0: 正式的 21:00~07:00 窗口.
+ * ⚠️ 测试完务必改回 0 再烧录. */
+#define NIGHT_TEST_MODE 0
+
+/* 夜间省电时段判断: 21:00~07:00 无业务数据需求, 关 WiFi 省电.
+ * 用本地时间小时数判断; NTP 未同步(年份<2024)时视为白天, 避免误入省电. */
+static bool is_night(void)
+{
+    time_t now = 0;
+    time(&now);
+    struct tm ti = {0};
+    localtime_r(&now, &ti);
+    if (ti.tm_year < (2024 - 1900)) return false;  /* 时间没同步, 不省电 */
+#if NIGHT_TEST_MODE
+    return (ti.tm_min % 2) != 0;   /* 测试: 奇数分钟=夜间, 每分钟切换 */
+#else
+    int h = ti.tm_hour;
+    return (h >= 21 || h < 7);   /* 21:00~06:59 为夜间 */
+#endif
+}
+
 static void api_task(void *pv)
 {
     /* 设置负偏移让首次请求立即触发 */
@@ -246,8 +270,38 @@ static void api_task(void *pv)
     /* NTP 每 24h 重新同步一次, 防止晶振长期漂移 (开机已同步过, 故初值=now) */
     TickType_t last_ntp = xTaskGetTickCount();
 
+    /* 夜间省电状态: 进入夜间关 WiFi 射频, 白天恢复. 全程 CPU 不睡, 无唤醒风险. */
+    static bool s_in_night = false;
+
     while (1) {
         TickType_t now = xTaskGetTickCount();
+
+        /* ===== 夜间省电时间门控 (21:00–07:00) =====
+         * 仅在 NTP 对过时(时间可信)后才据此判断, 否则时间不准会误判. */
+        bool night = is_night();
+        if (night && !s_in_night) {
+            /* 进入夜间: 关射频 (省电大头), 停止一切 API 请求 */
+            s_in_night = true;
+            wifi_radio_off();
+            ESP_LOGI(TAG, "==> Night power-save (21:00-07:00): WiFi off");
+        } else if (!night && s_in_night) {
+            /* 出夜间: 重开射频, 连上后重拉一轮数据 + 对时 */
+            ESP_LOGI(TAG, "==> Day resume: WiFi on, refetching...");
+            if (wifi_radio_on() == ESP_OK) {
+                s_in_night = false;
+                /* 负偏移让各项立即重拉; NTP 也立即重同步 */
+                last_weather = last_fund = last_gold = last_ds = -pdMS_TO_TICKS(3600000);
+                last_ntp = now - pdMS_TO_TICKS(24 * 3600 * 1000);
+            }
+            /* wifi_radio_on 失败则保持 s_in_night=true, 下一轮(5s后)再试, 不卡死 */
+        }
+
+        /* 夜间: 射频已关, 跳过所有联网请求, 只维持时钟/屏幕显示 */
+        if (s_in_night) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
         bool wifi_ok = wifi_is_connected();
         wifi_check_reconnect();
 

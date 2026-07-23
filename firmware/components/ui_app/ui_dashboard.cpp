@@ -166,7 +166,8 @@ void dashboard_update(const AppData_t *app)
     set_label(l_ihum, b);
     snprintf(b, sizeof b, "电池: %d%%", app->battery_pct);
     set_label(l_ibat, b);
-    snprintf(b, sizeof b, "WiFi: %s", wifi_is_connected() ? "OK" : "NO");
+    snprintf(b, sizeof b, "WiFi: %s",
+             wifi_is_night_sleep() ? "Zzz" : (wifi_is_connected() ? "OK" : "NO"));
     set_label(l_iwifi, b);
 
     /* 预报卡 */

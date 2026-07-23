@@ -74,6 +74,7 @@ static lv_obj_t *ui_weather_indoor;
 static lv_obj_t *ui_gold_text;
 static lv_obj_t *ui_gold_change;
 static lv_obj_t *fund_labels[MAX_FUNDS][3]; /* [i][0]=name, [1]=nav, [2]=chg */
+static lv_obj_t *fund_nav_hdr = NULL;       /* "净值"表头, 附带净值日期 */
 /* 走势柱条已移除 */
 static int       fund_count = 0;
 static const char *fund_names[MAX_FUNDS] = {"摩根日本精选股票(QDII)A","摩根纳斯达克100指数(QDII)","广发全球精选股票(QDII)"};
@@ -184,11 +185,11 @@ static void create_content_area(lv_obj_t *parent)
     lv_obj_set_style_text_font(h_name, &*FONT_CN, 0);
     lv_obj_align(h_name, LV_ALIGN_TOP_LEFT, rx, fy);
 
-    lv_obj_t *h_nav = lv_label_create(parent);
-    lv_label_set_text(h_nav, "净值");
-    lv_obj_set_style_text_color(h_nav, C_BLACK, 0);
-    lv_obj_set_style_text_font(h_nav, &*FONT_CN, 0);
-    lv_obj_align(h_nav, LV_ALIGN_TOP_LEFT, rx + 220, fy);
+    fund_nav_hdr = lv_label_create(parent);
+    lv_label_set_text(fund_nav_hdr, "净值");
+    lv_obj_set_style_text_color(fund_nav_hdr, C_BLACK, 0);
+    lv_obj_set_style_text_font(fund_nav_hdr, &*FONT_CN, 0);
+    lv_obj_align(fund_nav_hdr, LV_ALIGN_TOP_LEFT, rx + 220, fy);
 
     lv_obj_t *h_chg = lv_label_create(parent);
     lv_label_set_text(h_chg, "涨跌");
@@ -296,9 +297,12 @@ void ui_update_all(const AppData_t *app)
     time(&t_now);
     localtime_r(&t_now, &ti);
     const char *wday_cn[] = {"日","一","二","三","四","五","六"};
-    bool wifi_ok = wifi_is_connected();
+    /* 夜间省电时射频已关, 显示"WiFi:Zzz"(休眠)而非"WiFi:NO", 避免误以为故障.
+     * 用 ASCII Zzz 而非中文"省电": 精简字库无"省"字, 会渲染成方框 */
+    const char *wifi_str = wifi_is_night_sleep() ? "WiFi:Zzz"
+                         : (wifi_is_connected() ? "WiFi:OK" : "WiFi:NO");
     snprintf(date_buf, sizeof(date_buf), "%s %02d/%02d %s%s",
-             wifi_ok ? "WiFi:OK" : "WiFi:NO",
+             wifi_str,
              ti.tm_mon + 1, ti.tm_mday,
              "星期",
              wday_cn[ti.tm_wday]);
@@ -365,6 +369,17 @@ void ui_update_all(const AppData_t *app)
             set_label(fund_labels[i][2], "--");
         }
     }  /* for fund_count */
+
+    /* 净值日期显示在表头 (QDII 为 T-1, 让用户知道是哪天的净值) */
+    if (fund_nav_hdr) {
+        const char *d = "";
+        for (int i = 0; i < app->fund_count && i < MAX_FUNDS; i++)
+            if (app->funds[i].nav_date[0]) { d = app->funds[i].nav_date; break; }
+        if (d[0]) {
+            snprintf(buf, sizeof(buf), "净值 %s", d);
+            set_label(fund_nav_hdr, buf);
+        }
+    }
 
     /* DeepSeek */
     if (app->ds.balance > 0) {

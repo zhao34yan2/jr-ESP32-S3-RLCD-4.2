@@ -11,9 +11,10 @@ extern "C" {
 typedef struct {
     char code[8];            /* 基金代码 */
     char name[48];           /* 基金名称 */
-    float nav;               /* 最新净值 */
-    float change_pct;        /* 估算涨跌幅 (%) */
+    float nav;               /* 最新单位净值 */
+    float change_pct;        /* 净值涨跌幅 (%) */
     int   is_up;             /* 1=涨, 0=跌 */
+    char nav_date[12];       /* 净值日期 MM-DD (QDII 为 T-1/T-2) */
 } FundItem_t;
 
 #define MAX_FUNDS 3

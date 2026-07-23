@@ -287,124 +287,99 @@ static char *https_get(const char *url, const char *header_key, const char *head
 static void get_bridge_base(char *buf, size_t sz);
 
 /* ===== Funds (fundgz + East Money HTTPS fallback) ===== */
+/* 单支基金走 Bridge 兜底 (东财主接口失败时) */
+static bool fund_fetch_bridge(FundItem_t *f, const char *code)
+{
+    char base[64];
+    get_bridge_base(base, sizeof(base));
+    char burl[256];
+    snprintf(burl, sizeof(burl), "%s/api/fund/%s", base, code);
+    char *bp = http_get(burl);
+    if (!bp) { ESP_LOGW(TAG, "Fund %s: Bridge fail", code); return false; }
+    ESP_LOGI(TAG, "Bridge resp: %.60s", bp);
+    cJSON *br = cJSON_Parse(bp); free(bp);
+    if (!br) { ESP_LOGW(TAG, "Bridge: JSON parse fail"); return false; }
+    bool ok = false;
+    cJSON *item = cJSON_GetObjectItem(br, "nav");
+    if (item) { f->nav = (float)item->valuedouble; ok = true; }
+    else ESP_LOGW(TAG, "Bridge: no nav field");
+    cJSON_Delete(br);
+    return ok;
+}
+
+/* ===== Funds — 东财移动端 FundMNFInfo (一次请求查全部) =====
+ * fundgz 实时估值接口已下线; QDII 本无实时估值 (GSZ=null).
+ * 改用官方单位净值 NAV + 净值日期 PDATE + 官方涨跌 NAVCHGRT, 一次请求查多支.
+ * 单支失败回退 Bridge. */
 esp_err_t api_fetch_funds(FundItem_t *funds, int *count)
 {
-    int got = 0;
-    for (int i = 0; i < s_fund_count && i < MAX_FUNDS; i++) {
-        FundItem_t *f = &funds[i];
-
-        /* 保留旧代码, 只更新成功获取的数据 */
-        strlcpy(f->code, s_fund_codes[i], sizeof(f->code));
-
-        /* 尝试 fundgz 实时估值 */
-        char url[128];
-        snprintf(url, sizeof(url), "http://fundgz.1234567.com.cn/js/%s.js", s_fund_codes[i]);
-        char *resp = http_get(url);
-        if (resp) {
-            char *p = strchr(resp, '{');
-            if (p) {
-                char *end = strrchr(resp, '}');
-                if (end) {
-                    *(end + 1) = '\0';
-                    cJSON *root = cJSON_Parse(p);
-                    if (root) {
-                        cJSON *item;
-                        if ((item = cJSON_GetObjectItem(root, "name")) && cJSON_IsString(item))
-                            strlcpy(f->name, item->valuestring, sizeof(f->name));
-                        if ((item = cJSON_GetObjectItem(root, "gsz")) && cJSON_IsString(item))
-                            f->nav = (float)atof(item->valuestring);
-                        if ((item = cJSON_GetObjectItem(root, "gszzl")) && cJSON_IsString(item)) {
-                            f->change_pct = (float)atof(item->valuestring);
-                            f->is_up = (f->change_pct >= 0) ? 1 : 0;
-                        }
-                        if (f->nav < 0.001f && (item = cJSON_GetObjectItem(root, "dwjz")) && cJSON_IsString(item))
-                            f->nav = (float)atof(item->valuestring);
-                        cJSON_Delete(root);
-                        free(resp);
-                        ESP_LOGI(TAG, "Fund %s: %.4f", f->code, f->nav);
-                        got++;
-                        continue;
-                    }
-                }
-            }
-            free(resp);
-        }
-
-        /* Fallback: East Money HTTPS (流式解析, 取最后一个 y 值) */
-        if (f->nav < 0.01f) {
-            char emurl[128];
-            snprintf(emurl, sizeof(emurl),
-                     "https://fund.eastmoney.com/pingzhongdata/%s.js", s_fund_codes[i]);
-            ESP_LOGI(TAG, "EM streaming: %s", s_fund_codes[i]);
-            float nav = 0;
-            esp_http_client_config_t cfg = {0};
-            cfg.url = emurl; cfg.timeout_ms = 10000;
-            cfg.skip_cert_common_name_check = true;
-            esp_http_client_handle_t c = esp_http_client_init(&cfg);
-            if (c && esp_http_client_open(c, 0) == ESP_OK) {
-                esp_http_client_fetch_headers(c);
-                char buf[256];
-                int depth = 0;
-                int in_trend = 0;
-                while (1) {
-                    int n = esp_http_client_read(c, buf, sizeof(buf) - 1);
-                    if (n <= 0) break;
-                    buf[n] = '\0';
-                    char *p = buf;
-                    while (*p) {
-                        if (!in_trend) {
-                            if (strncmp(p, "Data_netWorthTrend", 18) == 0) {
-                                in_trend = 1;
-                                p += 18;
-                                continue;
-                            }
-                        } else {
-                            if (depth > 0 || *p == '[') {
-                                if (*p == '[') depth++;
-                                else if (*p == ']') { depth--; if (depth == 0) break; }
-                                else if (strncmp(p, "\"y\":", 4) == 0) {
-                                    p += 4;
-                                    while (*p == ' ') p++;
-                                    nav = (float)atof(p);
-                                    continue;
-                                }
-                            }
-                        }
-                        p++;
-                    }
-                    if (depth == 0 && in_trend) break;  /* 数组已读完 */
-                }
-                esp_http_client_close(c);
-                esp_http_client_cleanup(c);
-            } else if (c) {
-                esp_http_client_cleanup(c);
-            }
-            if (nav > 0.001f) {
-                f->nav = nav;
-                got++;
-                ESP_LOGI(TAG, "Fund %s EM: %.4f", s_fund_codes[i], nav);
-                continue;
-            }
-        }
-
-        /* Fallback to Bridge */
-        char base[64];
-        get_bridge_base(base, sizeof(base));
-        char burl[256];
-        snprintf(burl, sizeof(burl), "%s/api/fund/%s", base, s_fund_codes[i]);
-        char *bp = http_get(burl);
-        if (bp) {
-            ESP_LOGI(TAG, "Bridge resp: %.60s", bp);
-            cJSON *br = cJSON_Parse(bp); free(bp);
-            if (br) {
-                cJSON *item = cJSON_GetObjectItem(br, "nav");
-                if (item) { f->nav = (float)item->valuedouble; got++; }
-                else { ESP_LOGW(TAG, "Bridge: no nav field"); }
-                cJSON_Delete(br);
-            } else { ESP_LOGW(TAG, "Bridge: JSON parse fail"); }
-        } else { ESP_LOGW(TAG, "Fund %s: Bridge fallback fail", f->code); }
-    }
     *count = s_fund_count;
+
+    /* 预置代码, 并记录哪些已成功 (供 Bridge 兜底判断) */
+    bool ok[MAX_FUNDS] = { false };
+    for (int i = 0; i < s_fund_count && i < MAX_FUNDS; i++)
+        strlcpy(funds[i].code, s_fund_codes[i], sizeof(funds[i].code));
+
+    /* 拼多基金查询: Fcodes=code1,code2,... */
+    char codes[64] = {0};
+    for (int i = 0; i < s_fund_count && i < MAX_FUNDS; i++) {
+        strlcat(codes, s_fund_codes[i], sizeof(codes));
+        if (i + 1 < s_fund_count) strlcat(codes, ",", sizeof(codes));
+    }
+    char url[256];
+    snprintf(url, sizeof(url),
+             "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo"
+             "?pageIndex=1&pageSize=%d&plat=Android&appType=ttjj&product=EFund"
+             "&Version=1&deviceid=esp32&Fcodes=%s",
+             s_fund_count, codes);
+    ESP_LOGI(TAG, "Funds FundMNFInfo: %s", codes);
+
+    char *resp = https_get(url, "Referer", "https://fund.eastmoney.com/");
+    int got = 0;
+    if (resp) {
+        cJSON *root = cJSON_Parse(resp);
+        free(resp);
+        if (root) {
+            cJSON *datas = cJSON_GetObjectItem(root, "Datas");
+            if (datas && cJSON_IsArray(datas)) {
+                int n = cJSON_GetArraySize(datas);
+                for (int k = 0; k < n; k++) {
+                    cJSON *d = cJSON_GetArrayItem(datas, k);
+                    cJSON *jc = cJSON_GetObjectItem(d, "FCODE");
+                    if (!jc || !cJSON_IsString(jc)) continue;
+                    /* 找到对应槽位 */
+                    int idx = -1;
+                    for (int i = 0; i < s_fund_count && i < MAX_FUNDS; i++)
+                        if (strcmp(funds[i].code, jc->valuestring) == 0) { idx = i; break; }
+                    if (idx < 0) continue;
+                    FundItem_t *f = &funds[idx];
+                    cJSON *it;
+                    if ((it = cJSON_GetObjectItem(d, "SHORTNAME")) && cJSON_IsString(it))
+                        strlcpy(f->name, it->valuestring, sizeof(f->name));
+                    if ((it = cJSON_GetObjectItem(d, "NAV")) && cJSON_IsString(it) && it->valuestring[0])
+                        f->nav = (float)atof(it->valuestring);
+                    if ((it = cJSON_GetObjectItem(d, "NAVCHGRT")) && cJSON_IsString(it) && it->valuestring[0]) {
+                        f->change_pct = (float)atof(it->valuestring);
+                        f->is_up = (f->change_pct >= 0) ? 1 : 0;
+                    }
+                    /* PDATE 形如 "2026-07-22", 存成 "07-22" 省显示空间 */
+                    if ((it = cJSON_GetObjectItem(d, "PDATE")) && cJSON_IsString(it) &&
+                        strlen(it->valuestring) >= 10)
+                        strlcpy(f->nav_date, it->valuestring + 5, sizeof(f->nav_date));
+                    if (f->nav > 0.001f) { ok[idx] = true; got++;
+                        ESP_LOGI(TAG, "Fund %s: %.4f (%s) %.2f%%", f->code, f->nav, f->nav_date, f->change_pct); }
+                }
+            }
+            cJSON_Delete(root);
+        }
+    }
+
+    /* 未成功的基金逐个走 Bridge 兜底 */
+    for (int i = 0; i < s_fund_count && i < MAX_FUNDS; i++) {
+        if (ok[i] || funds[i].nav > 0.001f) continue;
+        if (fund_fetch_bridge(&funds[i], s_fund_codes[i])) got++;
+    }
+
     return (got > 0) ? ESP_OK : ESP_FAIL;
 }
 

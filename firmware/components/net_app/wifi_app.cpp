@@ -24,6 +24,8 @@ static const int WIFI_CONNECTED_BIT = BIT0;
 static int s_retry_count = 0;
 /* STA 自动重连开关: 进 AP 配网前置 false, 避免重连与 WiFi 扫描抢射频 */
 static volatile bool s_reconnect_enabled = true;
+/* 夜间省电: 射频已 stop, 重连检查跳过 (白天 resume 后清零) */
+static volatile bool s_night_sleep = false;
 
 /* ===== WiFi 事件处理 ===== */
 static void wifi_event_handler(void *arg, esp_event_base_t base,
@@ -99,9 +101,16 @@ bool wifi_is_connected(void)
     return (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
 }
 
+/* 是否处于夜间省电态 (射频已关) — 供 UI 区分"故障断网"与"主动省电" */
+bool wifi_is_night_sleep(void)
+{
+    return s_night_sleep;
+}
+
 void wifi_check_reconnect(void)
 {
     if (!s_reconnect_enabled) return;  /* 配网模式下不重连 */
+    if (s_night_sleep) return;         /* 夜间省电: 射频已停, 不重连 */
     if (!wifi_is_connected()) {
         static uint32_t last_try = 0;
         uint32_t now = xTaskGetTickCount() / pdMS_TO_TICKS(1000);
@@ -140,6 +149,38 @@ void wifi_switch_network(const char *ssid, const char *password)
     esp_wifi_set_config(WIFI_IF_STA, &wc);
     esp_wifi_connect();
     ESP_LOGI(TAG, "Switching to fallback WiFi: %s", ssid);
+}
+
+/* 夜间省电: 停 WiFi 射频 (关掉最大耗电源). 不销毁驱动/netif, 只是 esp_wifi_stop,
+ * 早上 wifi_radio_on 里 esp_wifi_start 即可恢复, 全程 CPU 不睡, 无唤醒风险. */
+esp_err_t wifi_radio_off(void)
+{
+    if (s_night_sleep) return ESP_OK;      /* 已在夜间态, 幂等 */
+    s_night_sleep = true;
+    s_retry_count = 99;                    /* 事件处理里不再触发重连 */
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    esp_sntp_stop();                       /* 停 SNTP, 否则夜间无网仍后台发包/刷失败日志 */
+    esp_wifi_disconnect();
+    esp_err_t err = esp_wifi_stop();       /* 关射频 (省电大头) */
+    ESP_LOGI(TAG, "Night mode: WiFi radio stopped (power save)");
+    return err;
+}
+
+/* 白天恢复: 重开 WiFi 射频并重连. 返回 ESP_OK 表示 start 成功 (连接由事件异步完成).
+ * 若 start 失败, 保持夜间态标志由调用方决定是否下轮重试, 不会卡死. */
+esp_err_t wifi_radio_on(void)
+{
+    if (!s_night_sleep) return ESP_OK;     /* 本就在白天态 */
+    esp_err_t err = esp_wifi_start();      /* 重开射频 */
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Day resume: esp_wifi_start fail (%s), will retry", esp_err_to_name(err));
+        return err;                        /* 保持 s_night_sleep=true, 调用方下轮再试 */
+    }
+    s_night_sleep = false;
+    s_retry_count = 0;
+    esp_wifi_connect();                    /* STA_START 事件也会触发, 这里再补一次无害 */
+    ESP_LOGI(TAG, "Day mode: WiFi radio resumed");
+    return ESP_OK;
 }
 
 /* ===== NTP 时间同步 ===== */

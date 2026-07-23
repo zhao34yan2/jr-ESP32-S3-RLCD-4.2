@@ -45,6 +45,23 @@ void wifi_stop_sta_reconnect(void);
 void wifi_switch_network(const char *ssid, const char *password);
 
 /**
+ * @brief 夜间省电: 停止 WiFi 射频 (不销毁驱动, 保留配置). 会禁用自动重连.
+ * @return ESP_OK 成功
+ */
+esp_err_t wifi_radio_off(void);
+
+/**
+ * @brief 白天恢复: 重新开启 WiFi 射频并发起连接. 重新启用自动重连.
+ * @return ESP_OK 成功 (仅表示射频已启动, 连接结果需再 wait_connected)
+ */
+esp_err_t wifi_radio_on(void);
+
+/**
+ * @brief 是否处于夜间省电态 (射频已停). UI 据此显示"省电"而非"WiFi:NO".
+ */
+bool wifi_is_night_sleep(void);
+
+/**
  * @brief 同步 NTP 时间
  * @return ESP_OK 成功
  */
