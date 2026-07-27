@@ -34,12 +34,28 @@
 #include "api_clients.h"
 #include "ui_main.h"
 #include "ui_dashboard.h"
+#include "ui_sysinfo.h"
 
 static const char *TAG = "MAIN";
 
-static int g_page = 0;
-static bool g_key_last = true;  /* KEY=GPIO0默认高电平 */
+/* 左键 GPIO18: 官方板载第二按键 (右键=BOOT/GPIO0). 低电平有效. */
+#define KEY2_GPIO           GPIO_NUM_18
+
+#define PAGE_COUNT 3
+static int g_page = 0;          /* 0=主界面 1=四宫格 2=系统监控 */
+static bool g_key_last = true;  /* 右键 GPIO0 默认高电平 */
+static bool g_key2_last = true; /* 左键 GPIO18 默认高电平 */
 static lv_obj_t *main_screen = NULL;
+
+/* 按页号取屏幕对象 */
+static lv_obj_t *screen_for_page(int p)
+{
+    switch (p) {
+        case 0:  return main_screen;
+        case 1:  return dashboard_get_screen();
+        default: return sysinfo_get_screen();
+    }
+}
 
 DisplayPort RlcdPort(RLCD_MOSI_PIN, RLCD_SCK_PIN, RLCD_DC_PIN,
                      RLCD_CS_PIN, RLCD_RST_PIN, LCD_WIDTH, LCD_HEIGHT);
@@ -423,17 +439,26 @@ static void ui_task(void *pv)
             DATA_UNLOCK();
         }
 
+        bool key2 = (gpio_get_level(KEY2_GPIO) == 0);
+
         if (Lvgl_lock(100)) {
-            /* KEY按下检测 (下降沿) — 手动切换页面, 切换后强制立即重绘 */
+            /* 翻页 (下降沿触发): 右键 GPIO0 前进, 左键 GPIO18 后退. 三屏循环. */
             bool page_switched = false;
             if (key && !g_key_last) {
-                g_page = !g_page;
-                lv_scr_load_anim(g_page == 0 ? main_screen : dashboard_get_screen(),
+                g_page = (g_page + 1) % PAGE_COUNT;
+                lv_scr_load_anim(screen_for_page(g_page),
                                   LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
-                ESP_LOGI(TAG, "Switch to page %d", g_page);
+                ESP_LOGI(TAG, "Next page %d", g_page);
+                page_switched = true;
+            } else if (key2 && !g_key2_last) {
+                g_page = (g_page + PAGE_COUNT - 1) % PAGE_COUNT;
+                lv_scr_load_anim(screen_for_page(g_page),
+                                  LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
+                ESP_LOGI(TAG, "Prev page %d", g_page);
                 page_switched = true;
             }
             g_key_last = key;
+            g_key2_last = key2;
 
             /* 内容每 5 秒重算一次 (或切页/首次立即重算); 时钟已只到分, 5 秒粒度足够,
              * set_label 再按需刷新, 文本没变则整屏不重绘 */
@@ -447,8 +472,10 @@ static void ui_task(void *pv)
                 DATA_UNLOCK();
                 if (g_page == 0)
                     ui_update_all(&local_data);
-                else
+                else if (g_page == 1)
                     dashboard_update(&local_data);
+                else
+                    sysinfo_update(&local_data);
             }
 
             Lvgl_unlock();
@@ -870,16 +897,17 @@ extern "C" void app_main(void)
         Lvgl_unlock();
     }
 
-    /* 初始化KEY (GPIO0) */
+    /* 初始化按键: 右键 GPIO0 (BOOT) + 左键 GPIO18, 均上拉输入, 低电平有效 */
     gpio_config_t io_conf;
     memset(&io_conf, 0, sizeof(io_conf));
     io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pin_bit_mask = (1ULL << KEY_GPIO);
+    io_conf.pin_bit_mask = (1ULL << KEY_GPIO) | (1ULL << KEY2_GPIO);
     io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     gpio_config(&io_conf);
-    g_key_last = gpio_get_level(KEY_GPIO);
+    g_key_last  = gpio_get_level(KEY_GPIO);
+    g_key2_last = gpio_get_level(KEY2_GPIO);
 
     /* 5. 连接 WiFi, 失败则进 AP 配网模式 */
     /* 优先读取配网页面存入 NVS 的凭证 (ssid=主, ssid2=上次用过的备用); 读不到再回退 secrets.h */
@@ -929,9 +957,10 @@ extern "C" void app_main(void)
         start_ap_provision();
     }
 
-    /* 6. 初始化仪表盘页面 (持 LVGL 锁: 此时 LVGL 任务已在运行, 避免创建对象与渲染竞争) */
+    /* 6. 初始化仪表盘 + 系统监控页 (持 LVGL 锁: 此时 LVGL 任务已在运行, 避免创建对象与渲染竞争) */
     if (Lvgl_lock(-1)) {
         dashboard_create();
+        sysinfo_create();
         Lvgl_unlock();
     }
 

@@ -1,20 +1,21 @@
 /**
- * @file ui_dashboard.cpp — 四宫格桌面屏保
+ * @file ui_dashboard.cpp — 第二屏: 天气主题 (仿 234.png)
  *
- * 字体: custom_font_14_big (等线 14px, 1bpp)
- * 与 ui_main.cpp 完全相同的字体声明方式
+ * 布局 (400x300):
+ * ┌─ 状态栏 (时间/日期/周几 · 信号/电量) ───────────── 24px
+ * ├─ 中部双栏 ─────────────────────────────────── 150px
+ * │  当前天气(大温度+图标+体感/湿度/风/降水) │ 室内(温/湿/电/WiFi)
+ * ├─ 7天预报 (7列: 周几/日期/图标/高/低) ──────────  剩余
+ * └──────────────────────────────────────────────
+ *
+ * 字体: custom_font_14_big (等线 14px 中文) + font_num_40 (大温度) + Montserrat
+ * 天气图标: weather_icons.c (A8 位图, 大/小两套)
  */
 
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <esp_log.h>
-#include <esp_chip_info.h>
-#include <esp_heap_caps.h>
-#include <esp_idf_version.h>
-#include <esp_timer.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
 #include <lvgl.h>
 #include "ui_dashboard.h"
 #include "wifi_app.h"
@@ -25,19 +26,66 @@ static const char *TAG = "DASH";
 #define C_BLACK lv_color_black()
 #define C_WHITE lv_color_white()
 
-/* 与 ui_main.cpp 完全一致的字体声明 */
 LV_FONT_DECLARE(custom_font_14_big);
-#define FONT_CN  (&custom_font_14_big)
+LV_FONT_DECLARE(font_num_40);
+#define FONT_CN   (&custom_font_14_big)
+#define FONT_NUM  (&font_num_40)
 
-/* ===== 所有标签句柄 ===== */
+/* 天气图标 (A8), 由 gen_weather_icons.py 生成 */
+LV_IMAGE_DECLARE(wi_sun_big);   LV_IMAGE_DECLARE(wi_sun_sm);
+LV_IMAGE_DECLARE(wi_partly_big);LV_IMAGE_DECLARE(wi_partly_sm);
+LV_IMAGE_DECLARE(wi_cloud_big); LV_IMAGE_DECLARE(wi_cloud_sm);
+LV_IMAGE_DECLARE(wi_fog_big);   LV_IMAGE_DECLARE(wi_fog_sm);
+LV_IMAGE_DECLARE(wi_rain_big);  LV_IMAGE_DECLARE(wi_rain_sm);
+LV_IMAGE_DECLARE(wi_heavyrain_big); LV_IMAGE_DECLARE(wi_heavyrain_sm);
+LV_IMAGE_DECLARE(wi_snow_big);  LV_IMAGE_DECLARE(wi_snow_sm);
+
+/* WMO 天气码 → 图标 (big=当前, sm=预报) */
+static const lv_image_dsc_t *code_icon(int code, bool big)
+{
+    switch (code) {
+        case 0: case 1:            return big ? &wi_sun_big    : &wi_sun_sm;
+        case 2:                    return big ? &wi_partly_big : &wi_partly_sm;
+        case 3:                    return big ? &wi_cloud_big  : &wi_cloud_sm;
+        case 45: case 48:          return big ? &wi_fog_big    : &wi_fog_sm;
+        case 51: case 53: case 55:
+        case 56: case 57:
+        case 61: case 66: case 67:
+        case 80:                   return big ? &wi_rain_big   : &wi_rain_sm;
+        case 63: case 65:
+        case 81: case 82:          return big ? &wi_heavyrain_big : &wi_heavyrain_sm;
+        case 71: case 73: case 75:
+        case 77: case 85: case 86: return big ? &wi_snow_big   : &wi_snow_sm;
+        case 95: case 96: case 99: return big ? &wi_heavyrain_big : &wi_heavyrain_sm;
+        default:                   return big ? &wi_cloud_big  : &wi_cloud_sm;
+    }
+}
+
+/* ===== 控件句柄 ===== */
 static lv_obj_t *scr;
-static lv_obj_t *l_date, *l_wkd, *l_cond, *l_temp, *l_city;
-static lv_obj_t *l_itemp, *l_ihum, *l_ibat, *l_iwifi;
-static lv_obj_t *l_fc[3];
-static lv_obj_t *l_d1, *l_d2, *l_d3, *l_d4;
+/* 状态栏 */
+static lv_obj_t *l_time, *l_date, *l_batt;
+static lv_obj_t *sig_bar[4], *batt_box, *batt_fill;
+/* 当前天气 */
+static lv_obj_t *l_cur_temp, *l_cur_loc, *l_cur_cond, *cur_ico;
+static lv_obj_t *l_feel, *l_hum, *l_wind, *l_prec;
+/* 室内 */
+static lv_obj_t *l_in_temp, *l_in_hum, *l_in_bat, *l_in_wifi;
+/* 预报 7 列 */
+static lv_obj_t *fc_wk[7], *fc_dt[7], *fc_ic[7], *fc_hi[7], *fc_lo[7];
+static int fc_last_code[7] = {-1,-1,-1,-1,-1,-1,-1};
 
-/* ===== 辅助: 创建标签 ===== */
-static lv_obj_t *mk(lv_obj_t *p, const char *t, lv_coord_t x, lv_coord_t y, const lv_font_t *f)
+/* 仅在文本变化时才 set (反射屏静止零重绘) */
+static void set_label(lv_obj_t *l, const char *txt)
+{
+    if (!l) return;
+    const char *cur = lv_label_get_text(l);
+    if (cur && strcmp(cur, txt) == 0) return;
+    lv_label_set_text(l, txt);
+}
+
+/* 通用: 创建标签 */
+static lv_obj_t *mk(lv_obj_t *p, const char *t, int x, int y, const lv_font_t *f)
 {
     lv_obj_t *l = lv_label_create(p);
     lv_label_set_text(l, t);
@@ -47,181 +95,256 @@ static lv_obj_t *mk(lv_obj_t *p, const char *t, lv_coord_t x, lv_coord_t y, cons
     return l;
 }
 
-/* ===== 辅助: 创建带边框卡片 ===== */
-static lv_obj_t *card(lv_obj_t *p, const char *title,
-                       lv_coord_t x, lv_coord_t y, lv_coord_t w, lv_coord_t h)
+/* 竖直/水平分隔线 */
+static void hline(lv_obj_t *p, int x, int y, int w)
 {
-    lv_obj_t *c = lv_obj_create(p);
-    lv_obj_set_size(c, w, h);
-    lv_obj_set_style_border_color(c, C_BLACK, 0);
-    lv_obj_set_style_border_width(c, 1, 0);
-    lv_obj_set_style_bg_color(c, C_WHITE, 0);
-    lv_obj_set_style_radius(c, 0, 0);
-    lv_obj_set_style_pad_all(c, 0, 0);
-    lv_obj_set_scrollbar_mode(c, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_align(c, LV_ALIGN_TOP_LEFT, x, y);
-
-    lv_obj_t *tl = lv_label_create(c);
-    lv_label_set_text(tl, title);
-    lv_obj_set_style_text_color(tl, C_BLACK, 0);
-    lv_obj_set_style_text_font(tl, FONT_CN, 0);
-    lv_obj_align(tl, LV_ALIGN_TOP_LEFT, 4, 2);
-
-    lv_obj_t *ln = lv_obj_create(c);
-    lv_obj_set_size(ln, w - 8, 1);
-    lv_obj_set_style_bg_color(ln, C_BLACK, 0);
-    lv_obj_set_style_border_width(ln, 0, 0);
-    lv_obj_align(ln, LV_ALIGN_TOP_LEFT, 4, 18);
-
-    return c;
+    lv_obj_t *l = lv_obj_create(p);
+    lv_obj_set_size(l, w, 1);
+    lv_obj_set_style_bg_color(l, C_BLACK, 0);
+    lv_obj_set_style_border_width(l, 0, 0);
+    lv_obj_set_style_radius(l, 0, 0);
+    lv_obj_align(l, LV_ALIGN_TOP_LEFT, x, y);
+}
+static void vline(lv_obj_t *p, int x, int y, int h)
+{
+    lv_obj_t *l = lv_obj_create(p);
+    lv_obj_set_size(l, 1, h);
+    lv_obj_set_style_bg_color(l, C_BLACK, 0);
+    lv_obj_set_style_border_width(l, 0, 0);
+    lv_obj_set_style_radius(l, 0, 0);
+    lv_obj_align(l, LV_ALIGN_TOP_LEFT, x, y);
 }
 
-/* ===== 创建 ===== */
+/* 区块标题左侧的实心竖条 (仿 234.png 的 ▊) */
+static void title_bar(lv_obj_t *p, int x, int y)
+{
+    lv_obj_t *b = lv_obj_create(p);
+    lv_obj_set_size(b, 3, 13);
+    lv_obj_set_style_bg_color(b, C_BLACK, 0);
+    lv_obj_set_style_border_width(b, 0, 0);
+    lv_obj_set_style_radius(b, 0, 0);
+    lv_obj_align(b, LV_ALIGN_TOP_LEFT, x, y);
+}
+
+/* 布局常量 */
+#define STATUS_H  24
+#define MID_Y     (STATUS_H + 1)
+#define MID_H     150
+#define CUR_W     232
+#define FC_Y      (MID_Y + MID_H + 1)
+
 void dashboard_create(void)
 {
-    /* 设置字体回退 (与 ui_main.cpp 完全一致) */
-    ((lv_font_t *)(FONT_CN))->fallback = &lv_font_montserrat_14;
+    ((lv_font_t *)FONT_CN)->fallback = &lv_font_montserrat_14;
 
     scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, C_WHITE, 0);
+    lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 卡片尺寸 (无顶部状态栏) */
-    const lv_coord_t CW = 190, CH = 130;
-    const lv_coord_t X1 = 4, X2 = X1 + CW + 8;
-    const lv_coord_t Y1 = 4, Y2 = Y1 + CH + 6;
+    /* ===== ① 状态栏 ===== */
+    l_time = mk(scr, "--:--", 5, 4, &lv_font_montserrat_16);
+    l_date = mk(scr, "--月--日 周-", 70, 6, FONT_CN);
 
-    /* ── 天气卡 ── */
-    {
-        lv_obj_t *c = card(scr, "天气", X1, Y1, CW, CH);
-        l_date = mk(c, "----/--/--", 4, 22, &lv_font_montserrat_14);
-        l_wkd  = mk(c, "---", 4, 40, FONT_CN);
-        l_cond = mk(c, "--", 4, 58, FONT_CN);
-        l_temp = mk(c, "--", 4, 76, &lv_font_montserrat_14);
-        l_city = mk(c, "---", 4, 98, FONT_CN);
+    /* 电量数字 + 电池框 (右) */
+    l_batt = mk(scr, "--%", 330, 5, &lv_font_montserrat_14);
+    lv_obj_align(l_batt, LV_ALIGN_TOP_RIGHT, -26, 5);
+    batt_box = lv_obj_create(scr);
+    lv_obj_set_size(batt_box, 22, 12);
+    lv_obj_set_style_bg_color(batt_box, C_WHITE, 0);
+    lv_obj_set_style_border_color(batt_box, C_BLACK, 0);
+    lv_obj_set_style_border_width(batt_box, 1, 0);
+    lv_obj_set_style_radius(batt_box, 1, 0);
+    lv_obj_set_style_pad_all(batt_box, 2, 0);
+    lv_obj_set_scrollbar_mode(batt_box, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_align(batt_box, LV_ALIGN_TOP_RIGHT, -2, 6);
+    batt_fill = lv_obj_create(batt_box);
+    lv_obj_set_style_bg_color(batt_fill, C_BLACK, 0);
+    lv_obj_set_style_border_width(batt_fill, 0, 0);
+    lv_obj_set_style_radius(batt_fill, 0, 0);
+    lv_obj_align(batt_fill, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_size(batt_fill, 16, 8);
+
+    /* 信号 4 格 (电量左侧) */
+    for (int i = 0; i < 4; i++) {
+        sig_bar[i] = lv_obj_create(scr);
+        int h = 3 + i * 3;
+        lv_obj_set_size(sig_bar[i], 3, h);
+        lv_obj_set_style_bg_color(sig_bar[i], C_BLACK, 0);
+        lv_obj_set_style_border_width(sig_bar[i], 0, 0);
+        lv_obj_set_style_radius(sig_bar[i], 0, 0);
+        lv_obj_align(sig_bar[i], LV_ALIGN_TOP_RIGHT, -70 + i * 5, 6 + (11 - h));
     }
 
-    /* ── 室内卡 ── */
-    {
-        lv_obj_t *c = card(scr, "室内", X2, Y1, CW, CH);
-        l_itemp = mk(c, "温度: --.-C", 4, 22, FONT_CN);
-        l_ihum  = mk(c, "湿度: --%", 4, 44, FONT_CN);
-        l_ibat  = mk(c, "电池: ---", 4, 66, FONT_CN);
-        l_iwifi = mk(c, "WiFi: ---", 4, 88, FONT_CN);
+    hline(scr, 0, STATUS_H, 400);
+
+    /* ===== ② 中部双栏 ===== */
+    vline(scr, CUR_W, MID_Y, MID_H);
+    hline(scr, 0, MID_Y + MID_H, 400);
+
+    /* --- 左: 当前天气 --- */
+    title_bar(scr, 5, MID_Y + 6);
+    mk(scr, "当前", 11, MID_Y + 3, FONT_CN);
+    mk(scr, "CURRENT", 48, MID_Y + 5, &lv_font_montserrat_12);
+    l_cur_loc = mk(scr, "建邺·南京", CUR_W - 90, MID_Y + 3, FONT_CN);
+    lv_label_set_long_mode(l_cur_loc, LV_LABEL_LONG_CLIP);
+
+    l_cur_temp = mk(scr, "--", 8, MID_Y + 22, FONT_NUM);
+    l_cur_cond = mk(scr, "--", 10, MID_Y + 74, FONT_CN);
+
+    cur_ico = lv_image_create(scr);
+    lv_image_set_src(cur_ico, &wi_cloud_big);
+    lv_obj_align(cur_ico, LV_ALIGN_TOP_LEFT, CUR_W - 92, MID_Y + 26);
+
+    hline(scr, 8, MID_Y + 96, CUR_W - 16);
+
+    /* 体感/湿度/风/降水: 两列 */
+    int gx1 = 10, gx2 = 120, gy = MID_Y + 102, gyr = 22;
+    mk(scr, "体感", gx1, gy, FONT_CN);
+    l_feel = mk(scr, "--°", gx1 + 38, gy, FONT_CN);
+    mk(scr, "湿度", gx2, gy, FONT_CN);
+    l_hum  = mk(scr, "--%", gx2 + 38, gy, FONT_CN);
+    mk(scr, "风", gx1, gy + gyr, FONT_CN);
+    l_wind = mk(scr, "--级", gx1 + 38, gy + gyr, FONT_CN);
+    mk(scr, "降水", gx2, gy + gyr, FONT_CN);
+    l_prec = mk(scr, "--%", gx2 + 38, gy + gyr, FONT_CN);
+
+    /* --- 右: 室内 --- */
+    int ix = CUR_W + 8;
+    title_bar(scr, ix, MID_Y + 6);
+    mk(scr, "室内", ix + 6, MID_Y + 3, FONT_CN);
+    mk(scr, "INDOOR", ix + 44, MID_Y + 5, &lv_font_montserrat_12);
+
+    int iy = MID_Y + 30, ir = 30;
+    mk(scr, "温度", ix + 2, iy, FONT_CN);
+    l_in_temp = mk(scr, "--°C", ix + 2, iy, FONT_CN);
+    lv_obj_align(l_in_temp, LV_ALIGN_TOP_RIGHT, -8, iy);
+    mk(scr, "湿度", ix + 2, iy + ir, FONT_CN);
+    l_in_hum = mk(scr, "--%", ix + 2, iy + ir, FONT_CN);
+    lv_obj_align(l_in_hum, LV_ALIGN_TOP_RIGHT, -8, iy + ir);
+    mk(scr, "电池", ix + 2, iy + ir * 2, FONT_CN);
+    l_in_bat = mk(scr, "--%", ix + 2, iy + ir * 2, FONT_CN);
+    lv_obj_align(l_in_bat, LV_ALIGN_TOP_RIGHT, -8, iy + ir * 2);
+    mk(scr, "WiFi", ix + 2, iy + ir * 3, &lv_font_montserrat_14);
+    l_in_wifi = mk(scr, "--", ix + 2, iy + ir * 3, &lv_font_montserrat_16);
+    lv_obj_align(l_in_wifi, LV_ALIGN_TOP_RIGHT, -8, iy + ir * 3);
+
+    /* ===== ③ 7天预报 ===== */
+    title_bar(scr, 5, FC_Y + 5);
+    mk(scr, "7天预报", 11, FC_Y + 2, FONT_CN);
+    mk(scr, "FORECAST", 78, FC_Y + 4, &lv_font_montserrat_12);
+
+    int col_w = 400 / 7;
+    int row_y = FC_Y + 22;
+    for (int i = 0; i < 7; i++) {
+        int cx = i * col_w + col_w / 2;
+        fc_wk[i] = mk(scr, "--", 0, row_y, FONT_CN);
+        lv_obj_set_style_text_align(fc_wk[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(fc_wk[i], col_w);
+        lv_obj_align(fc_wk[i], LV_ALIGN_TOP_LEFT, i * col_w, row_y);
+
+        fc_dt[i] = mk(scr, "--/--", 0, row_y + 16, &lv_font_montserrat_10);
+        lv_obj_set_style_text_align(fc_dt[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(fc_dt[i], col_w);
+        lv_obj_align(fc_dt[i], LV_ALIGN_TOP_LEFT, i * col_w, row_y + 16);
+
+        fc_ic[i] = lv_image_create(scr);
+        lv_image_set_src(fc_ic[i], &wi_cloud_sm);
+        lv_obj_align(fc_ic[i], LV_ALIGN_TOP_LEFT, cx - 21, row_y + 30);
+
+        fc_hi[i] = mk(scr, "--°", 0, row_y + 66, FONT_CN);
+        lv_obj_set_style_text_align(fc_hi[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(fc_hi[i], col_w);
+        lv_obj_align(fc_hi[i], LV_ALIGN_TOP_LEFT, i * col_w, row_y + 66);
+
+        fc_lo[i] = mk(scr, "--°", 0, row_y + 82, &lv_font_montserrat_12);
+        lv_obj_set_style_text_align(fc_lo[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(fc_lo[i], col_w);
+        lv_obj_align(fc_lo[i], LV_ALIGN_TOP_LEFT, i * col_w, row_y + 82);
     }
 
-    /* ── 预报卡 ── */
-    {
-        lv_obj_t *c = card(scr, "预报", X1, Y2, CW, CH);
-        for (int i = 0; i < 3; i++)
-            l_fc[i] = mk(c, "---", 4, 22 + i * 20, FONT_CN);
-    }
-
-    /* ── 设备卡 ── */
-    {
-        lv_obj_t *c = card(scr, "设备", X2, Y2, CW, CH);
-        l_d1 = mk(c, "---", 4, 22, &lv_font_montserrat_12);
-        l_d2 = mk(c, "---", 4, 44, &lv_font_montserrat_12);
-        l_d3 = mk(c, "---", 4, 66, FONT_CN);
-        l_d4 = mk(c, "---", 4, 88, &lv_font_montserrat_12);
-    }
-
-    ESP_LOGI(TAG, "4-grid (custom_font_14_big)");
+    ESP_LOGI(TAG, "weather dashboard created");
 }
 
-/* 仅在文本变化时才 set, 避免无谓 invalidate → 整屏重绘 (反射屏静止时零刷新) */
-static void set_label(lv_obj_t *l, const char *txt)
-{
-    if (!l) return;
-    const char *cur = lv_label_get_text(l);
-    if (cur && strcmp(cur, txt) == 0) return;
-    lv_label_set_text(l, txt);
-}
-
-/* ===== 更新 ===== */
 void dashboard_update(const AppData_t *app)
 {
-    char b[80];
+    char b[48];
     time_t t;
     struct tm ti;
     time(&t);
     localtime_r(&t, &ti);
 
-    /* 天气卡 */
-    snprintf(b, sizeof b, "%04d/%02d/%02d", ti.tm_year+1900, ti.tm_mon+1, ti.tm_mday);
-    set_label(l_date, b);
+    /* ① 状态栏 */
+    snprintf(b, sizeof b, "%02d:%02d", ti.tm_hour, ti.tm_min);
+    set_label(l_time, b);
     static const char *wd[] = {"日","一","二","三","四","五","六"};
-    snprintf(b, sizeof b, "星期%s", wd[ti.tm_wday]);
-    set_label(l_wkd, b);
-    if (app->weather.condition[0]) {  /* 有数据即显示, 避免冬天低温被温度阈值误判 */
-        set_label(l_cond, app->weather.condition);
-        snprintf(b, sizeof b, "%.0f-%.0fC", app->weather.temp_min, app->weather.temp_max);
-        set_label(l_temp, b);
+    snprintf(b, sizeof b, "%d月%d日 周%s", ti.tm_mon + 1, ti.tm_mday, wd[ti.tm_wday]);
+    set_label(l_date, b);
+    snprintf(b, sizeof b, "%d%%", app->battery_pct);
+    set_label(l_batt, b);
+    int fw = app->battery_pct * 16 / 100;
+    if (fw < 1) fw = 1;
+    lv_obj_set_width(batt_fill, fw);
+
+    /* 信号格: 按 RSSI 点亮 (未连接全灭) */
+    int rssi = wifi_get_rssi();
+    int bars = 0;
+    if (wifi_is_connected() && rssi < 0) {
+        if (rssi >= -60) bars = 4;
+        else if (rssi >= -70) bars = 3;
+        else if (rssi >= -80) bars = 2;
+        else bars = 1;
     }
-    set_label(l_city, WEATHER_CITY);
+    for (int i = 0; i < 4; i++)
+        lv_obj_set_style_bg_opa(sig_bar[i], i < bars ? LV_OPA_COVER : LV_OPA_30, 0);
 
-    /* 室内卡 */
-    snprintf(b, sizeof b, "温度: %.1fC", app->indoor_temp);
-    set_label(l_itemp, b);
-    snprintf(b, sizeof b, "湿度: %d%%", (int)app->indoor_hum);
-    set_label(l_ihum, b);
-    snprintf(b, sizeof b, "电池: %d%%", app->battery_pct);
-    set_label(l_ibat, b);
-    snprintf(b, sizeof b, "WiFi: %s",
-             wifi_is_night_sleep() ? "Zzz" : (wifi_is_connected() ? "OK" : "NO"));
-    set_label(l_iwifi, b);
+    /* ② 当前天气 */
+    const WeatherData_t *w = &app->weather;
+    if (w->condition[0]) {
+        snprintf(b, sizeof b, "%.0f°C", w->temp_outdoor);
+        set_label(l_cur_temp, b);
+        set_label(l_cur_cond, w->condition);
+        lv_image_set_src(cur_ico, code_icon(w->code, true));
 
-    /* 预报卡 */
-    int nd = app->weather.fc_count > 3 ? 3 : app->weather.fc_count;
+        snprintf(b, sizeof b, "%.0f°", w->apparent_temp);
+        set_label(l_feel, b);
+        snprintf(b, sizeof b, "%d%%", w->humidity);
+        set_label(l_hum, b);
+        snprintf(b, sizeof b, "%d级", w->wind_level);
+        set_label(l_wind, b);
+        snprintf(b, sizeof b, "%d%%", w->precip_prob);
+        set_label(l_prec, b);
+    }
+
+    /* ③ 室内 */
+    snprintf(b, sizeof b, "%.1f°C", app->indoor_temp);
+    set_label(l_in_temp, b);
+    snprintf(b, sizeof b, "%d%%RH", (int)app->indoor_hum);
+    set_label(l_in_hum, b);
+    snprintf(b, sizeof b, "%d%%", app->battery_pct);
+    set_label(l_in_bat, b);
+    set_label(l_in_wifi, wifi_is_night_sleep() ? "Zzz"
+                       : (wifi_is_connected() ? "OK" : "NO"));
+
+    /* ④ 7天预报 */
+    int nd = w->fc_count < 7 ? w->fc_count : 7;
     for (int i = 0; i < nd; i++) {
         struct tm fd = ti;
         fd.tm_mday += i;
         mktime(&fd);
-        snprintf(b, sizeof b, "%02d/%02d%s %.0f-%.0fC",
-                 fd.tm_mon+1, fd.tm_mday,
-                 app->weather.fc_cond[i],
-                 app->weather.fc_min[i], app->weather.fc_max[i]);
-        set_label(l_fc[i], b);
-    }
-
-    /* 设备卡 — 简洁监控 */
-    {
-        esp_chip_info_t ci;
-        esp_chip_info(&ci);
-
-        /* 总内存 (内部 RAM + PSRAM) */
-        size_t r_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL)
-                       + heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-        size_t r_free  = esp_get_free_heap_size();
-        int pct = (r_total > 0) ? (int)(r_free * 100 / r_total) : 0;
-
-        snprintf(b, sizeof b, "CPU: %dMHz  Free:%d%%",
-                 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ, pct);
-        set_label(l_d1, b);
-
-        size_t r_used = r_total - r_free;
-        snprintf(b, sizeof b, "RAM: %.1f/%.1fM",
-                 (double)r_used / (1024*1024), (double)r_total / (1024*1024));
-        set_label(l_d2, b);
-
-        /* 电量趋势 (替代PSRAM行) */
-        if (app->bat_log_count < 2) {
-            snprintf(b, sizeof b, "电耗:等待中..");
-        } else if (app->bat_drop_per_h > 0) {
-            snprintf(b, sizeof b, "电耗:%d%%/h %dh",
-                     app->bat_drop_per_h, app->bat_est_hours);
-        } else if (app->bat_drop_per_h < 0) {
-            snprintf(b, sizeof b, "Charging..");
-        } else {
-            snprintf(b, sizeof b, "电耗:--%%/h");
+        snprintf(b, sizeof b, "周%s", wd[fd.tm_wday]);
+        set_label(fc_wk[i], b);
+        snprintf(b, sizeof b, "%d/%d", fd.tm_mon + 1, fd.tm_mday);
+        set_label(fc_dt[i], b);
+        if (w->fc_code[i] != fc_last_code[i]) {
+            lv_image_set_src(fc_ic[i], code_icon(w->fc_code[i], false));
+            fc_last_code[i] = w->fc_code[i];
         }
-        set_label(l_d3, b);
-
-        uint64_t us = esp_timer_get_time();
-        snprintf(b, sizeof b, "Up: %uh%02um",
-                 (unsigned)(us/3600000000ULL), (unsigned)((us%3600000000ULL)/60000000ULL));
-        set_label(l_d4, b);
+        snprintf(b, sizeof b, "%.0f°", w->fc_max[i]);
+        set_label(fc_hi[i], b);
+        snprintf(b, sizeof b, "%.0f°", w->fc_min[i]);
+        set_label(fc_lo[i], b);
     }
-
 }
 
 lv_obj_t *dashboard_get_screen(void)

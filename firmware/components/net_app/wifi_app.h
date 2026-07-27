@@ -61,6 +61,12 @@ esp_err_t wifi_radio_on(void);
  */
 bool wifi_is_night_sleep(void);
 
+/* ===== 监控屏 getter ===== */
+const char *wifi_get_ip(void);      /* 本机 IP 字符串 */
+const char *wifi_get_ssid(void);    /* 当前 SSID */
+int wifi_get_rssi(void);            /* RSSI dBm (负值), 未连接=0 */
+int wifi_get_channel(void);         /* 信道, 未连接=0 */
+
 /**
  * @brief 同步 NTP 时间
  * @return ESP_OK 成功

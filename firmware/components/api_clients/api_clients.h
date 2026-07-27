@@ -20,18 +20,25 @@ typedef struct {
 #define MAX_FUNDS 3
 
 /* 天气信息 */
-#define FORECAST_DAYS 3
+#define FORECAST_DAYS 7
 
 typedef struct {
     float temp_outdoor;      /* 室外温度 */
     float temp_min;          /* 最低温 */
     float temp_max;          /* 最高温 */
     char condition[24];      /* 天气状况 (晴/阴/雨) */
+    int   code;              /* 当前 WMO 天气码 (用于选图标) */
     int   pm25;              /* PM2.5 */
+    /* 当前扩展指标 */
+    float apparent_temp;     /* 体感温度 */
+    int   humidity;          /* 室外相对湿度 (%) */
+    int   wind_level;        /* 风力等级 (0~12) */
+    int   precip_prob;       /* 降水概率 (%) */
     /* 未来几天预报 */
     float fc_min[FORECAST_DAYS];
     float fc_max[FORECAST_DAYS];
     char fc_cond[FORECAST_DAYS][12];
+    int  fc_code[FORECAST_DAYS];   /* 每日 WMO 天气码 (用于选图标) */
     int  fc_count;
 } WeatherData_t;
 

@@ -26,6 +26,9 @@ static int s_retry_count = 0;
 static volatile bool s_reconnect_enabled = true;
 /* 夜间省电: 射频已 stop, 重连检查跳过 (白天 resume 后清零) */
 static volatile bool s_night_sleep = false;
+/* 监控屏用: 连接后保存本机 IP / SSID (供 getter 读取) */
+static char s_ip_str[16]  = "0.0.0.0";
+static char s_ssid_str[33] = "";
 
 /* ===== WiFi 事件处理 ===== */
 static void wifi_event_handler(void *arg, esp_event_base_t base,
@@ -51,6 +54,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_count = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
@@ -73,6 +77,7 @@ void wifi_init_sta(const char *ssid, const char *password)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                 &wifi_event_handler, NULL));
 
+    strlcpy(s_ssid_str, ssid, sizeof(s_ssid_str));   /* 监控屏用 */
     wifi_config_t wifi_config = {0};
     strlcpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
     strlcpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
@@ -105,6 +110,33 @@ bool wifi_is_connected(void)
 bool wifi_is_night_sleep(void)
 {
     return s_night_sleep;
+}
+
+/* ===== 监控屏 getter: 本机 IP / SSID / RSSI 信号 / 信道 ===== */
+const char *wifi_get_ip(void)
+{
+    return s_ip_str;
+}
+
+const char *wifi_get_ssid(void)
+{
+    return s_ssid_str;
+}
+
+/* RSSI (dBm, 负值). 未连接返回 0. */
+int wifi_get_rssi(void)
+{
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) return ap.rssi;
+    return 0;
+}
+
+/* 当前信道. 未连接返回 0. */
+int wifi_get_channel(void)
+{
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) return ap.primary;
+    return 0;
 }
 
 void wifi_check_reconnect(void)
@@ -143,6 +175,7 @@ void wifi_switch_network(const char *ssid, const char *password)
         (password && password[0]) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     wc.sta.pmf_cfg.capable  = true;
     wc.sta.pmf_cfg.required = false;
+    strlcpy(s_ssid_str, ssid, sizeof(s_ssid_str));
     s_retry_count = 0;
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     esp_wifi_disconnect();
