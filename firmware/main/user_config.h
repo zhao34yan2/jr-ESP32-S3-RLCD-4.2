@@ -35,20 +35,11 @@
  * 软件配置
  * ============================================================ */
 
-/* NTP */
-#define NTP_SERVER1         "pool.ntp.org"
-#define NTP_SERVER2         "ntp.aliyun.com"
-#define NTP_SERVER3         "time.windows.com"
-#define NTP_TIMEOUT_MS      10000
-
 /* 数据刷新间隔 (秒) */
 #define WEATHER_REFRESH_SEC     1800    /* 30 分钟 */
 #define GOLD_REFRESH_SEC        1800    /* 30 分钟 */
 #define FUND_REFRESH_SEC        1800    /* 30 分钟 */
 #define DEEPSEEK_REFRESH_SEC    300     /* 5 分钟 */
 #define SENSOR_REFRESH_SEC      60      /* 1 分钟 */
-
-/* LVGL 缓冲区 */
-#define LVGL_BUF_SIZE       (LCD_WIDTH * 40)
 
 #endif /* USER_CONFIG_H */

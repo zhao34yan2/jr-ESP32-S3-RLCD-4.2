@@ -4,13 +4,16 @@
  *
  * 基金监控 · 天气 · 黄金 · DeepSeek Token 用量
  * Board: Waveshare ESP32-S3-RLCD-4.2
+ *
+ * 职责: 启动编排 + 三个业务任务 (sensor/api/ui) + Bridge 自动发现.
+ * 电池采样/趋势 → battery.cpp; AP 配网 (DNS/HTTP 门户) → provisioning.cpp.
  */
 
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
-#include <sys/select.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -19,11 +22,10 @@
 #include <freertos/semphr.h>
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <esp_pm.h>
 #include <nvs_flash.h>
 #include <nvs.h>
-#include <esp_wifi.h>
 
-#include <esp_adc/adc_oneshot.h>
 #include "display_bsp.h"
 #include "lvgl_bsp.h"
 #include "user_config.h"
@@ -31,21 +33,49 @@
 
 #include "wifi_app.h"
 #include "shtc3.h"
+#include "pcf85063.h"
 #include "api_clients.h"
+#include "battery.h"
+#include "provisioning.h"
 #include "ui_main.h"
 #include "ui_dashboard.h"
 #include "ui_sysinfo.h"
 
 static const char *TAG = "MAIN";
 
-/* 左键 GPIO18: 官方板载第二按键 (右键=BOOT/GPIO0). 低电平有效. */
+/* 左键 GPIO18: 官方板载第二按键 (右键=BOOT/GPIO0). 低电平有效.
+ * 右键: 循环切屏. 左键: 短按(<2s)重启网络, 长按(≥2s)重启设备. */
 #define KEY2_GPIO           GPIO_NUM_18
+#define KEY2_HOLD_TICKS     40   /* 长按重启阈值: 40 轮 × 50ms = 2 秒 */
+
+/* 第一屏中文字库 (提示框用, 复用 ui_app 已链接的全量库) */
+LV_FONT_DECLARE(custom_font_16_big);
 
 #define PAGE_COUNT 3
 static int g_page = 0;          /* 0=主界面 1=四宫格 2=系统监控 */
 static bool g_key_last = true;  /* 右键 GPIO0 默认高电平 */
 static bool g_key2_last = true; /* 左键 GPIO18 默认高电平 */
 static lv_obj_t *main_screen = NULL;
+
+/* 在当前活动屏中央弹出一个提示条 (黑底白字), 供重启/重连反馈.
+ * 调用方须持有 LVGL 锁; 返回的对象由调用方决定是否删除 (重启场景无需删). */
+static lv_obj_t *ui_toast(const char *txt)
+{
+    lv_obj_t *box = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(box, 220, 56);
+    lv_obj_center(box);
+    lv_obj_set_style_bg_color(box, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(box, 4, 0);
+    lv_obj_set_style_border_width(box, 0, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *l = lv_label_create(box);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_color(l, lv_color_white(), 0);
+    lv_obj_set_style_text_font(l, &custom_font_16_big, 0);
+    lv_obj_center(l);
+    return box;
+}
 
 /* 按页号取屏幕对象 */
 static lv_obj_t *screen_for_page(int p)
@@ -59,152 +89,6 @@ static lv_obj_t *screen_for_page(int p)
 
 DisplayPort RlcdPort(RLCD_MOSI_PIN, RLCD_SCK_PIN, RLCD_DC_PIN,
                      RLCD_CS_PIN, RLCD_RST_PIN, LCD_WIDTH, LCD_HEIGHT);
-
-/* ===== 电池电量读取 (ADC1_CH3 = GPIO4) ===== */
-static adc_oneshot_unit_handle_t s_adc_handle = NULL;
-
-static int read_battery_pct(void)
-{
-    if (!s_adc_handle) {
-        adc_oneshot_unit_init_cfg_t init_cfg = { .unit_id = ADC_UNIT_1 };
-        if (adc_oneshot_new_unit(&init_cfg, &s_adc_handle) != ESP_OK) {
-            ESP_LOGE(TAG, "ADC unit init fail");
-            return -1;
-        }
-        adc_oneshot_chan_cfg_t chan_cfg = { .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_12 };
-        adc_oneshot_config_channel(s_adc_handle, ADC_CHANNEL_3, &chan_cfg);
-    }
-    /* 多次采样求平均, 抑制 ADC 噪声 (单次读数会跳变几十 LSB) */
-    int raw = 0;
-    {
-        int sum = 0, valid = 0;
-        for (int k = 0; k < 16; k++) {
-            int r = 0;
-            if (adc_oneshot_read(s_adc_handle, ADC_CHANNEL_3, &r) == ESP_OK) {
-                sum += r;
-                valid++;
-            }
-        }
-        if (valid == 0) return -1;
-        raw = sum / valid;
-    }
-    /* Li-ion 查表映射 (ADC → 电量%), 中间插值 */
-    static const int lut_adc[] = {1639,1600,1570,1540,1510,1480,1450,1420,1390,1360,1330,1300,1280};
-    static const int lut_pct[] = {100, 93,  85,  75,  65,  55,  45,  35,  25,  15,  8,   3,   0};
-    int pct = 0;
-    if (raw >= lut_adc[0]) {
-        pct = 100;
-    } else if (raw <= lut_adc[12]) {
-        pct = 0;
-    } else {
-        for (int i = 0; i < 12; i++) {
-            if (raw >= lut_adc[i+1] && raw < lut_adc[i]) {
-                pct = lut_pct[i] + (raw - lut_adc[i]) * (lut_pct[i+1] - lut_pct[i]) / (lut_adc[i+1] - lut_adc[i]);
-                break;
-            }
-        }
-    }
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    return pct;
-}
-
-/* ===== 电池电量趋势 (纯 RAM, 不落 NVS) =====
- * 旧版把 72 条记录反复写 16KB 的 NVS, 碎片化后 nvs_set 返回 NOT_ENOUGH_SPACE(0x1105),
- * 导致配网 WiFi 凭证存不进去. 趋势属非关键数据, 改为纯 RAM (重启重置), 彻底不占 NVS.
- * 电量% 由 ADC 直接读, 不受影响. */
-#define BAT_LOG_INTERVAL_MS  600000   /* 每10分钟采一次趋势 (>=2 次才出趋势, 即约 20 分钟后) */
-#define BAT_LOG_MAX          72
-
-static int32_t s_bat_log_count = 0;  /* 已采样次数 (>=2 才出趋势) */
-static int s_bat_peak_pct = -1;      /* 最高电量 (充满基准) */
-static uint32_t s_bat_peak_ts = 0;
-static int s_chg_reported = -1;      /* 已上报的充电电量 */
-
-/* 开机一次性清理旧版遗留的 battery NVS 命名空间, 回收被撑碎的空间 */
-static void battery_nvs_cleanup(void)
-{
-    nvs_handle_t h;
-    if (nvs_open("battery", NVS_READWRITE, &h) == ESP_OK) {
-        nvs_erase_all(h);
-        nvs_commit(h);
-        nvs_close(h);
-        ESP_LOGI("BAT", "old battery NVS cleared (reclaim space)");
-    }
-}
-
-static void battery_log_save(int pct)
-{
-    time_t now;
-    time(&now);
-    if (now < 100000) return; /* NTP未同步, 时间不可靠 */
-
-    /* 距上次采样够间隔才更新 (RAM 计时, 不落 NVS) */
-    static uint32_t s_last_ts = 0;
-    if (s_last_ts && (uint32_t)now - s_last_ts < BAT_LOG_INTERVAL_MS / 1000) return;
-    s_last_ts = (uint32_t)now;
-
-    if (s_bat_log_count < BAT_LOG_MAX) s_bat_log_count++;
-
-    /* 更新峰值: 仅当明显上升(>=3%)才视为充电, 忽略ADC波动 */
-    if (s_bat_peak_pct < 0 || pct > s_bat_peak_pct + 3) {
-        s_bat_peak_pct = pct;
-        s_bat_peak_ts = (uint32_t)now;
-    }
-}
-
-static void battery_calc_trend(AppData_t *app)
-{
-    app->bat_log_count = (int)s_bat_log_count;
-
-    if (s_bat_log_count < 2 || s_bat_peak_ts == 0) {
-        app->bat_drop_per_h = 0;
-        app->bat_est_hours = 999;
-        return;
-    }
-
-    /* 用峰值对比当前 */
-    uint32_t now = (uint32_t)time(NULL);
-    int dropped = s_bat_peak_pct - app->battery_pct;
-
-    /* 检测充电: 电量比上次高 = 在充电 (即使峰值更高) */
-    static int s_prev_pct = -1;
-    int is_charging = (dropped <= 0);
-    if (!is_charging && s_prev_pct >= 0 && app->battery_pct > s_prev_pct + 2) {
-        is_charging = true;  /* 电量回升超过2% = 充电 */
-    }
-
-    s_prev_pct = app->battery_pct;
-
-    if (is_charging) {
-        /* 充电中: 用插电前的电量作为起始值, 充满才跳100% */
-        if (s_chg_reported < 0) {
-            s_chg_reported = (s_prev_pct >= 0) ? s_prev_pct : app->battery_pct;
-        }
-        if (app->battery_pct >= 98) s_chg_reported = 100;
-        app->bat_charge_pct = (s_chg_reported > 100) ? 100 : s_chg_reported;
-        app->bat_drop_per_h = -1;
-        app->bat_est_hours = 999;
-        return;
-    }
-    /* 放电时重置充电状态 */
-    s_chg_reported = -1;
-
-    float elapsed_h = (float)(now - s_bat_peak_ts) / 3600.0f;
-    if (elapsed_h < 0.5f) { /* 刚拔USB不到30分钟, 数据太少 (Li-ion电压还稳定) */
-        app->bat_drop_per_h = -1;
-        return;
-    }
-
-    int per_h = (int)((float)dropped / elapsed_h + 0.5f);
-    if (per_h < 1) per_h = 1;
-
-    app->bat_drop_per_h = per_h;
-    app->bat_est_hours = app->battery_pct / per_h;
-
-    ESP_LOGI("BAT", "Trend: peak=%d%%, now=%d%%, drop=%d%% in %.1fh = %d%%/h",
-             s_bat_peak_pct, app->battery_pct, dropped, elapsed_h, per_h);
-}
 
 /* ===== LVGL 刷新回调 ===== */
 static void lvgl_flush_cb(lv_display_t *drv, const lv_area_t *area, uint8_t *color_map)
@@ -235,8 +119,9 @@ static void sensor_task(void *pv)
     while (1) {
         float temp = 0, hum = 0;
         if (shtc3_read(&temp, &hum) == ESP_OK) {
-            /* 合理性检查：温度 0~80°C（板子发热可能偏高），湿度 0~100% */
-            if (hum >= 0 && hum <= 100) {
+            /* 合理性检查：温度 -10~85°C（板子发热可能偏高），湿度 0~100%.
+             * SHTC3 出错可能给 -40 之类离谱值, 超范围整帧丢弃, 保留上次好值 */
+            if (hum >= 0 && hum <= 100 && temp >= -10 && temp <= 85) {
                 DATA_LOCK();
                 g_app_data.indoor_temp = temp;
                 g_app_data.indoor_hum  = hum;
@@ -250,7 +135,6 @@ static void sensor_task(void *pv)
     }
 }
 
-/* ===== API 轮询任务 ===== */
 /* ===== 夜间省电测试开关 =====
  * 置 1: 用"分钟奇偶"造快速循环 (偶数分=白天, 奇数分=夜间), 每分钟切换一次,
  *       烧录后 1~2 分钟即可在串口看到进/出省电全过程, 无需等到 21 点.
@@ -275,18 +159,52 @@ static bool is_night(void)
 #endif
 }
 
+/* NTP 对时成功后把系统时间回写 RTC, 供断网/夜间/掉电后恢复 */
+static void rtc_save_from_system(void)
+{
+    time_t now = time(NULL);
+    struct tm ti;
+    localtime_r(&now, &ti);
+    if (ti.tm_year < (2024 - 1900)) return;   /* 系统时间还不可信, 不污染 RTC */
+    if (pcf85063_write_time(&ti) == ESP_OK)
+        ESP_LOGI(TAG, "RTC synced from NTP: %04d-%02d-%02d %02d:%02d",
+                 ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday, ti.tm_hour, ti.tm_min);
+}
+
+/* ===== 夜间省电: 电源管理档位 (档位一 — 只夜间开 light-sleep) =====
+ * 白天 pm_set_night(false): 关 light-sleep + 定频 160MHz, 与不开 PM 时行为一致(白天零变化).
+ * 夜间 pm_set_night(true):  开自动 light-sleep + 动态调频 40~160MHz. 此时 WiFi 已关,
+ *   是最安全的 light-sleep 场景; CPU 空闲即由官方框架自动睡下, 省掉整夜 160MHz 空转.
+ * 保守起见睡眠时 CPU 不断电(sdkconfig POWER_DOWN_CPU_IN_LIGHT_SLEEP=n), 避开八线 PSRAM
+ *   缓存恢复的不稳点; 底噪略高但换稳定. */
+static void pm_set_night(bool night)
+{
+    esp_pm_config_t cfg = {
+        .max_freq_mhz = 160,
+        .min_freq_mhz = night ? 40 : 160,
+        .light_sleep_enable = night,
+    };
+    esp_err_t e = esp_pm_configure(&cfg);
+    if (e != ESP_OK)
+        ESP_LOGW(TAG, "esp_pm_configure(%s)=%s", night ? "night" : "day", esp_err_to_name(e));
+}
+
+/* ===== API 轮询任务 ===== */
 static void api_task(void *pv)
 {
     /* 设置负偏移让首次请求立即触发 */
     TickType_t last_weather = -pdMS_TO_TICKS(3600000); /* 立即触发 */
     TickType_t last_fund = -pdMS_TO_TICKS(3600000); /* 首次立即触发 (负>30分) */
     TickType_t last_gold = -pdMS_TO_TICKS(3600000);
-/* silver removed */
     TickType_t last_ds = -pdMS_TO_TICKS(3600000);
-    /* NTP 每 24h 重新同步一次, 防止晶振长期漂移 (开机已同步过, 故初值=now) */
+    /* NTP 每 24h 重新同步一次, 防止晶振长期漂移 (开机已同步过, 故初值=now).
+     * 注意: 不能写 pdMS_TO_TICKS(24*3600*1000) — 其内部 ms*HZ 乘积(8.64e10)溢出
+     * 32 位 TickType_t, 回绕后仅 ~500s. 直接算 tick 数(24*3600*HZ=86.4e6, 不溢出). */
+    const TickType_t NTP_INTERVAL_TICKS = (TickType_t)24 * 3600 * configTICK_RATE_HZ;
     TickType_t last_ntp = xTaskGetTickCount();
 
-    /* 夜间省电状态: 进入夜间关 WiFi 射频, 白天恢复. 全程 CPU 不睡, 无唤醒风险. */
+    /* 夜间省电状态: 进入夜间关 WiFi 射频 + 开 light-sleep(CPU 空闲自动睡), 白天恢复.
+     * 白天不睡(与原行为一致), 只在 WiFi 已关的夜间开睡眠 — 最安全的省电场景. */
     static bool s_in_night = false;
 
     while (1) {
@@ -296,20 +214,24 @@ static void api_task(void *pv)
          * 仅在 NTP 对过时(时间可信)后才据此判断, 否则时间不准会误判. */
         bool night = is_night();
         if (night && !s_in_night) {
-            /* 进入夜间: 关射频 (省电大头), 停止一切 API 请求 */
+            /* 进入夜间: 先关射频, 再开 light-sleep (顺序保证不出现 WiFi+睡眠并存) */
             s_in_night = true;
             wifi_radio_off();
-            ESP_LOGI(TAG, "==> Night power-save (21:00-07:00): WiFi off");
+            pm_set_night(true);
+            ESP_LOGI(TAG, "==> Night power-save (21:00-07:00): WiFi off + light-sleep");
         } else if (!night && s_in_night) {
-            /* 出夜间: 重开射频, 连上后重拉一轮数据 + 对时 */
-            ESP_LOGI(TAG, "==> Day resume: WiFi on, refetching...");
+            /* 出夜间: 先退 light-sleep 档, 再重开射频 (同样避免 WiFi+睡眠并存) */
+            ESP_LOGI(TAG, "==> Day resume: light-sleep off, WiFi on, refetching...");
+            pm_set_night(false);
             if (wifi_radio_on() == ESP_OK) {
                 s_in_night = false;
                 /* 负偏移让各项立即重拉; NTP 也立即重同步 */
                 last_weather = last_fund = last_gold = last_ds = -pdMS_TO_TICKS(3600000);
-                last_ntp = now - pdMS_TO_TICKS(24 * 3600 * 1000);
+                last_ntp = now - NTP_INTERVAL_TICKS;
+            } else {
+                /* 开 WiFi 失败: 回夜间省电档继续等, 下一轮(5s后)再试, 不卡死 */
+                pm_set_night(true);
             }
-            /* wifi_radio_on 失败则保持 s_in_night=true, 下一轮(5s后)再试, 不卡死 */
         }
 
         /* 夜间: 射频已关, 跳过所有联网请求, 只维持时钟/屏幕显示 */
@@ -322,10 +244,10 @@ static void api_task(void *pv)
         wifi_check_reconnect();
 
         /* 每 24 小时重新对时 — 需 WiFi */
-        if (wifi_ok && now - last_ntp >= pdMS_TO_TICKS(24 * 3600 * 1000)) {
+        if (wifi_ok && now - last_ntp >= NTP_INTERVAL_TICKS) {
             last_ntp = now;
             ESP_LOGI(TAG, "24h NTP re-sync...");
-            ntp_sync_time();
+            if (ntp_sync_time() == ESP_OK) rtc_save_from_system();
         }
 
         /* 天气 (5分钟) — 需 WiFi */
@@ -376,8 +298,6 @@ static void api_task(void *pv)
             }
         }
 
-/* 白银已移除 */
-
         /* Bridge URL 更新 => 立即重拉数据 */
         if (g_bridge_url_changed) {
             g_bridge_url_changed = 0;
@@ -413,6 +333,12 @@ static void ui_task(void *pv)
      * (时钟只到分, 5 秒粒度足够). 配合 set_label 只在文本变化时刷新, 静止时几乎不重绘. */
     TickType_t s_last_draw = 0;
     bool first_draw = true;
+    /* 左键状态: 按住轮数(每轮50ms)区分短按/长按; 短按重连的提示条到点自动删除 */
+    int        key2_hold  = 0;
+    lv_obj_t  *net_toast  = NULL;
+    TickType_t toast_hide = 0;
+    /* 短按重启网络: 锁内只建提示+置标志, 出锁后再做阻塞式射频操作 (避免持 LVGL 锁调 esp_wifi_stop/start) */
+    bool       net_restart_pending = false;
 
     while (1) {
         /* KEY检测 (在锁外也可以读GPIO) */
@@ -427,38 +353,84 @@ static void ui_task(void *pv)
             DATA_LOCK();
             memcpy(&bat_tmp, &g_app_data, sizeof(AppData_t));
             DATA_UNLOCK();
-            bat_tmp.battery_pct = read_battery_pct();
-            battery_log_save(bat_tmp.battery_pct);
-            battery_calc_trend(&bat_tmp);
-            DATA_LOCK();
-            g_app_data.battery_pct   = bat_tmp.battery_pct;
-            g_app_data.bat_drop_per_h = bat_tmp.bat_drop_per_h;
-            g_app_data.bat_est_hours  = bat_tmp.bat_est_hours;
-            g_app_data.bat_log_count  = bat_tmp.bat_log_count;
-            g_app_data.bat_charge_pct = bat_tmp.bat_charge_pct;
-            DATA_UNLOCK();
+            if (battery_update(&bat_tmp)) {
+                DATA_LOCK();
+                g_app_data.battery_pct    = bat_tmp.battery_pct;
+                g_app_data.bat_drop_per_h = bat_tmp.bat_drop_per_h;
+                g_app_data.bat_est_hours  = bat_tmp.bat_est_hours;
+                g_app_data.bat_log_count  = bat_tmp.bat_log_count;
+                g_app_data.bat_charge_pct = bat_tmp.bat_charge_pct;
+                DATA_UNLOCK();
+            } else {
+                ESP_LOGW(TAG, "ADC battery read failed, keep last value");
+            }
         }
 
         bool key2 = (gpio_get_level(KEY2_GPIO) == 0);
 
+        /* ── 按键边沿/计时全部在锁外算 (纯变量运算, 不受 LVGL 锁超时影响, 不丢键) ──
+         * 锁内只消费这里算好的"意图"标志去操作 LVGL 对象. 原先整段包在锁内, 反射屏
+         * 全屏刷新长时间持锁会导致 Lvgl_lock(100) 超时, 那一轮按键状态完全不更新→丢键,
+         * 且 key2_hold 只在成功持锁时 ++, "2秒"漂移成"40次成功持锁". */
+        bool page_edge  = (key && !g_key_last);      /* 右键下降沿: 切屏 */
+        bool long_fire  = false;                     /* 左键长按到点: 重启设备 */
+        bool short_fire = false;                     /* 左键短按松开: 重启网络 */
+        if (key2) {
+            key2_hold++;
+            /* >= 而非 == : key2_hold 在锁外自增, 若到点那轮恰好拿不到锁,
+             * long_fire 未被消费, 下一轮 key2_hold 已超过阈值; 用 >= 保证仍会触发 */
+            if (key2_hold >= KEY2_HOLD_TICKS) long_fire = true;
+        } else {
+            if (g_key2_last && key2_hold > 0 && key2_hold < KEY2_HOLD_TICKS)
+                short_fire = true;
+            key2_hold = 0;
+        }
+        g_key_last  = key;
+        g_key2_last = key2;
+
         if (Lvgl_lock(100)) {
-            /* 翻页 (下降沿触发): 右键 GPIO0 前进, 左键 GPIO18 后退. 三屏循环. */
             bool page_switched = false;
-            if (key && !g_key_last) {
+            /* 右键: 循环切屏 0→1→2→0 */
+            if (page_edge) {
                 g_page = (g_page + 1) % PAGE_COUNT;
                 lv_scr_load_anim(screen_for_page(g_page),
                                   LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
                 ESP_LOGI(TAG, "Next page %d", g_page);
                 page_switched = true;
-            } else if (key2 && !g_key2_last) {
-                g_page = (g_page + PAGE_COUNT - 1) % PAGE_COUNT;
-                lv_scr_load_anim(screen_for_page(g_page),
-                                  LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
-                ESP_LOGI(TAG, "Prev page %d", g_page);
-                page_switched = true;
             }
-            g_key_last = key;
-            g_key2_last = key2;
+
+            /* 左键长按: 重启设备 (弹提示→放锁→延时让提示刷出→重启) */
+            if (long_fire) {
+                ESP_LOGW(TAG, "Left key long-press: restarting device");
+                ui_toast("正在重启...");
+                Lvgl_unlock();
+                vTaskDelay(pdMS_TO_TICKS(800));
+                esp_restart();
+            }
+
+            /* 左键短按: 重启网络 (夜间只提示不动射频; 白天置标志出锁执行) */
+            if (short_fire) {
+                if (net_toast) lv_obj_del(net_toast);
+                if (is_night()) {
+                    ESP_LOGW(TAG, "Left key short-press ignored (night power-save)");
+                    net_toast  = ui_toast("夜间省电中");
+                    toast_hide = now + pdMS_TO_TICKS(2000);
+                } else {
+                    ESP_LOGW(TAG, "Left key short-press: restarting network");
+                    /* 第一段: "重启网络..."; 射频重启完成后 (锁外) 会把文字换成结果并延长,
+                     * 用"文字变化"给用户明确的前→后感知. 这里给个较长的兜底隐藏时间,
+                     * 万一重启后重新加锁失败, toast 也不会永久残留. */
+                    net_toast  = ui_toast("重启网络...");
+                    toast_hide = now + pdMS_TO_TICKS(4000);
+                    net_restart_pending = true;
+                }
+            }
+
+            /* 网络提示条到点自动删除 */
+            if (net_toast && now >= toast_hide) {
+                lv_obj_del(net_toast);
+                net_toast = NULL;
+            }
 
             /* 内容每 5 秒重算一次 (或切页/首次立即重算); 时钟已只到分, 5 秒粒度足够,
              * set_label 再按需刷新, 文本没变则整屏不重绘 */
@@ -480,338 +452,32 @@ static void ui_task(void *pv)
 
             Lvgl_unlock();
         }
+
+        /* 短按重启网络: 在锁外执行阻塞式射频操作 (esp_wifi_stop/start 会阻塞几十~几百ms),
+         * 避免持 LVGL 锁时卡住渲染任务; 提示条已在锁内先建好, 用户能立即看到. */
+        if (net_restart_pending) {
+            net_restart_pending = false;
+            /* 原子重启射频: wifi_restart_radio 内部持射频锁完成 off→on, 并在锁内重判夜间.
+             * 若执行到这里时已跨过 21:00 且 api_task 已切夜间省电, 则跳过, 不会把射频
+             * 整夜打开 (修 H3+M1: 原来 ui_task 无锁 radio_off()+radio_on() 与 api_task 竞态). */
+            wifi_restart_radio(is_night());
+            /* 第二段反馈: 重启完成后把提示文字从"重启网络..."换成结果.
+             * 反射屏无背光, 静止的框容易被忽略, 靠"文字变化"制造可感知的前→后差异,
+             * 并延长停留到 2.5s 给用户明确的"完成"确认. 需重新加锁改 UI. */
+            if (Lvgl_lock(200)) {
+                if (net_toast) {
+                    lv_obj_t *tl = lv_obj_get_child(net_toast, 0);
+                    if (tl) lv_label_set_text(tl, wifi_is_connected() ? "网络已重启" : "重连中...");
+                    toast_hide = xTaskGetTickCount() + pdMS_TO_TICKS(2500);
+                }
+                Lvgl_unlock();
+            }
+        }
+
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
-/* ===== WiFi 配网 (AP 模式 + 网页配置) ===== */
-/* DNS 服务器 (Captive Portal: 所有域名指向 192.168.4.1) */
-static void dns_task(void *pv)
-{
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) return;
-    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(53), .sin_addr = { .s_addr = htonl(INADDR_ANY) } };
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(sock); return; }
-    uint8_t buf[512];
-    while (1) {
-        struct sockaddr_in from; socklen_t flen = sizeof(from);
-        int n = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &flen);
-        if (n > 12 && (buf[2] & 0x80) == 0) {
-            buf[2] = 0x81; buf[3] = 0x80; buf[7] = 1;
-            int q = 12; while (q < n && buf[q] != 0) q++;
-            q += 5;
-            if (q + 16 <= (int)sizeof(buf)) {
-                buf[q] = 0xC0; buf[q+1] = 0x0C;
-                buf[q+2] = 0; buf[q+3] = 1;  buf[q+4] = 0; buf[q+5] = 1;
-                buf[q+6] = 0; buf[q+7] = 0; buf[q+8] = 0; buf[q+9] = 60;
-                buf[q+10] = 0; buf[q+11] = 4;
-                buf[q+12] = 192; buf[q+13] = 168; buf[q+14] = 4; buf[q+15] = 1;
-                sendto(sock, buf, q + 16, 0, (struct sockaddr *)&from, flen);
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-
-/* WiFi 扫描 (返回可选网络列表) */
-/* URL 解码 */
-static void url_decode(char *s) {
-    char *d = s;
-    while (*s) {
-        if (*s == '+') { *d++ = ' '; s++; }
-        else if (*s == '%' && s[1] && s[2]) {
-            int v = 0;
-            for (int i = 1; i <= 2; i++) {
-                char c = s[i];
-                v = v * 16 + (c >= 'a' ? c - 'a' + 10 : c >= 'A' ? c - 'A' + 10 : c - '0');
-            }
-            *d++ = v; s += 3;
-        } else { *d++ = *s++; }
-    }
-    *d = '\0';
-}
-
-/* 发送完整 HTTP 响应 (header 用 strlen 计算, 不写死长度) */
-static void http_send(int c, const char *status, const char *ctype, const char *body)
-{
-    char hdr[128];
-    int hlen = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.0 %s\r\nContent-Type: %s\r\nConnection: close\r\n\r\n",
-        status, ctype);
-    write(c, hdr, hlen);
-    if (body) write(c, body, strlen(body));
-}
-
-/* 302 跳转到配置门户 (用于 captive portal 探测) */
-static void http_redirect_portal(int c)
-{
-    const char *hdr =
-        "HTTP/1.0 302 Found\r\n"
-        "Location: http://192.168.4.1/\r\n"
-        "Connection: close\r\n\r\n";
-    write(c, hdr, strlen(hdr));
-}
-
-/* 提取 POST body 里某个表单字段 (application/x-www-form-urlencoded) */
-static bool form_get(const char *body, const char *key, char *out, size_t out_sz)
-{
-    char pat[24];
-    snprintf(pat, sizeof(pat), "%s=", key);
-    const char *p = strstr(body, pat);
-    if (!p) return false;
-    p += strlen(pat);
-    size_t i = 0;
-    while (*p && *p != '&' && *p != ' ' && *p != '\r' && *p != '\n' && i < out_sz - 1) {
-        out[i++] = *p++;
-    }
-    out[i] = '\0';
-    url_decode(out);   /* 解码 %XX 和 + */
-    return true;
-}
-
-/* URL 编码 (percent-encoding): 让 SSID 里的空格/特殊字符原样往返, 不被 '_' 替换污染 */
-static void url_encode(char *dst, size_t dstsz, const char *src)
-{
-    static const char *hex = "0123456789ABCDEF";
-    size_t d = 0;
-    for (const unsigned char *s = (const unsigned char *)src; *s && d + 3 < dstsz; s++) {
-        unsigned char c = *s;
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
-            dst[d++] = (char)c;
-        } else {
-            dst[d++] = '%';
-            dst[d++] = hex[(c >> 4) & 0xF];
-            dst[d++] = hex[c & 0xF];
-        }
-    }
-    dst[d] = '\0';
-}
-
-/* HTML 转义: 放进属性/文本时防止 ' " < > & 破坏页面 (显示名 + value 预填都用) */
-static void html_escape(char *dst, size_t dstsz, const char *src)
-{
-    size_t d = 0;
-    for (const char *s = src; *s; s++) {
-        const char *rep = NULL;
-        switch (*s) {
-            case '&': rep = "&amp;";  break;
-            case '<': rep = "&lt;";   break;
-            case '>': rep = "&gt;";   break;
-            case '\'':rep = "&#39;";  break;
-            case '"': rep = "&quot;"; break;
-        }
-        if (rep) {
-            size_t rl = strlen(rep);
-            if (d + rl >= dstsz) break;
-            memcpy(dst + d, rep, rl); d += rl;
-        } else {
-            if (d + 1 >= dstsz) break;
-            dst[d++] = *s;
-        }
-    }
-    dst[d] = '\0';
-}
-
-/* 简易 HTTP 服务器 (原始 socket, 不依赖 esp_http_server) */
-static void http_task(void *pv)
-{
-    int srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (srv < 0) return;
-    int opt = 1;
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(80), .sin_addr = { .s_addr = htonl(INADDR_ANY) } };
-    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(srv); return; }
-    listen(srv, 3);
-    while (1) {
-        struct sockaddr_in cli;
-        socklen_t clen = sizeof(cli);
-        int c = accept(srv, (struct sockaddr *)&cli, &clen);
-        if (c < 0) continue;
-        /* 每个连接设读超时, 防止半开连接阻塞 */
-        struct timeval tv = {5, 0};
-        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        /* static: http 任务单线程串行处理, 避免大数组占栈导致溢出 */
-        static char buf[1536];
-        memset(buf, 0, sizeof(buf));
-        /* 健壮读取: header 与 body 常分片到达 (甚至 Expect:100-continue),
-         * 只读一次会丢掉 POST 表单 body → 配置存不进去. 先读到完整 header, 再按
-         * Content-Length 补齐 body. */
-        int total = 0;
-        while (total < (int)sizeof(buf) - 1) {
-            int r = read(c, buf + total, sizeof(buf) - 1 - total);
-            if (r <= 0) break;
-            total += r;
-            buf[total] = '\0';
-            if (strstr(buf, "\r\n\r\n")) break;   /* header 读完 */
-        }
-        if (total > 0) {
-            /* 客户端若声明 Expect: 100-continue, 先回 100 它才会发送 body */
-            if (strstr(buf, "100-continue") || strstr(buf, "100-Continue")) {
-                const char *cont = "HTTP/1.1 100 Continue\r\n\r\n";
-                write(c, cont, strlen(cont));
-            }
-            /* POST: 按 Content-Length 把 body 收齐 (表单字段就在 body 里) */
-            char *hdr_end = strstr(buf, "\r\n\r\n");
-            if (hdr_end) {
-                const char *cl = strstr(buf, "Content-Length:");
-                if (!cl) cl = strstr(buf, "content-length:");
-                int content_len = cl ? atoi(cl + 15) : 0;
-                int body_have = total - (int)((hdr_end + 4) - buf);
-                while (body_have < content_len && total < (int)sizeof(buf) - 1) {
-                    int r = read(c, buf + total, sizeof(buf) - 1 - total);
-                    if (r <= 0) break;
-                    total += r;
-                    buf[total] = '\0';
-                    body_have = total - (int)((hdr_end + 4) - buf);
-                }
-            }
-
-            /* Captive Portal 探测: 手机连上开放热点后会请求这些 URL 判断是否有网,
-             * 统一 302 跳到门户, 手机才会自动弹出配置页并保持连接 */
-            if (strstr(buf, "generate_204") || strstr(buf, "gen_204") ||
-                strstr(buf, "hotspot-detect") || strstr(buf, "connectivitycheck") ||
-                strstr(buf, "ncsi.txt") || strstr(buf, "connecttest")) {
-                http_redirect_portal(c);
-                close(c);
-                continue;
-            }
-
-            if (strstr(buf, "GET /scan")) {
-                /* 扫描 WiFi (需 APSTA 模式, 纯 AP 下扫描会失败) */
-                uint16_t cnt = 16;
-                static wifi_ap_record_t rec[16];
-                esp_err_t se = esp_wifi_scan_start(NULL, true);
-                static char body[4096]; int pos = 0;
-                pos += snprintf(body + pos, sizeof(body) - pos,
-                    "<html><head><meta charset=utf-8></head><body><h2>选择 WiFi</h2>");
-                if (se == ESP_OK && esp_wifi_scan_get_ap_records(&cnt, rec) == ESP_OK) {
-                    if (cnt > 16) cnt = 16;
-                    for (int i = 0; i < cnt; i++) {
-                        if (rec[i].ssid[0] == '\0') continue;
-                        /* href 用 URL 编码 (原样往返), 显示用 HTML 转义 (防破坏页面) */
-                        char enc[128], disp[208];
-                        url_encode(enc, sizeof(enc), (const char *)rec[i].ssid);
-                        html_escape(disp, sizeof(disp), (const char *)rec[i].ssid);
-                        pos += snprintf(body + pos, sizeof(body) - pos,
-                            "<a href='/?s=%s' style='display:block;padding:8px;border:1px solid #ddd;text-decoration:none;color:#333'>%s</a>",
-                            enc, disp);
-                    }
-                } else {
-                    pos += snprintf(body + pos, sizeof(body) - pos,
-                        "<p>扫描失败, 请手动输入 WiFi 名称</p>");
-                }
-                snprintf(body + pos, sizeof(body) - pos, "<br><a href='/'>返回</a></body></html>");
-                http_send(c, "200 OK", "text/html", body);
-            } else if (strstr(buf, "POST /save")) {
-                /* 保存配置: 只覆盖 cfg 命名空间的 ssid/pass, 不擦除其它 NVS 数据 */
-                char ssid[33] = "", pass[65] = "";
-                bool has_ssid = form_get(buf, "ssid", ssid, sizeof(ssid));
-                form_get(buf, "pass", pass, sizeof(pass));
-                bool saved = false;
-                if (has_ssid && ssid[0]) {
-                    nvs_handle_t nv;
-                    if (nvs_open("cfg", NVS_READWRITE, &nv) == ESP_OK) {
-                        /* 先把当前主网络降为备用槽 (不同网络才备份, 避免重复写) */
-                        char cur[33] = {};
-                        size_t csz = sizeof(cur);
-                        if (nvs_get_str(nv, "ssid", cur, &csz) == ESP_OK &&
-                            cur[0] && strcmp(cur, ssid) != 0) {
-                            char curp[65] = {};
-                            csz = sizeof(curp);
-                            nvs_get_str(nv, "pass", curp, &csz);
-                            nvs_set_str(nv, "ssid2", cur);
-                            nvs_set_str(nv, "pass2", curp);
-                            ESP_LOGI(TAG, "Backup prev WiFi: %s", cur);
-                        }
-                        esp_err_t e1 = nvs_set_str(nv, "ssid", ssid);
-                        esp_err_t e2 = nvs_set_str(nv, "pass", pass);
-                        esp_err_t ce = nvs_commit(nv);
-                        nvs_close(nv);
-                        /* 三者都成功才算存好; set 失败(如分区满)时 commit 仍返回 0 */
-                        saved = (e1 == ESP_OK && e2 == ESP_OK && ce == ESP_OK);
-                        ESP_LOGI(TAG, "Saved WiFi cfg: ssid='%s' pass_len=%d set=%d/%d commit=%d",
-                                 ssid, (int)strlen(pass), e1, e2, ce);
-                    } else {
-                        ESP_LOGE(TAG, "POST /save: nvs_open cfg fail");
-                    }
-                } else {
-                    ESP_LOGW(TAG, "POST /save: ssid 解析失败 (body 未收全?), total=%d", total);
-                }
-                if (saved) {
-                    /* 只有真正存成功才重启, 避免"假成功"重启进坏状态 */
-                    http_send(c, "200 OK", "text/html",
-                        "<html><head><meta charset=utf-8></head><body>"
-                        "<h2>已保存, 正在重启...</h2></body></html>");
-                    close(c); close(srv);
-                    vTaskDelay(pdMS_TO_TICKS(2000));
-                    esp_restart();
-                    return;
-                }
-                /* 保存失败: 回错误页让用户重试, 不重启 */
-                http_send(c, "200 OK", "text/html",
-                    "<html><head><meta charset=utf-8></head><body>"
-                    "<h2>保存失败, 请返回重试</h2><a href='/'>返回</a></body></html>");
-            } else {
-                /* 首页 (含根路径和被劫持的其它域名) */
-                char sel[64] = "";
-                const char *q = strstr(buf, "?s=");
-                if (q) { q += 3; int i = 0; while (*q && *q != ' ' && *q != '&' && i < 63) sel[i++] = *q++; sel[i] = '\0'; url_decode(sel); }
-                char sel_esc[208];
-                html_escape(sel_esc, sizeof(sel_esc), sel);   /* 预填进 value='' 前转义, 防 ' 破坏属性 */
-                static char body[4096];
-                snprintf(body, sizeof(body),
-                    "<html><head><meta charset=utf-8><meta name=viewport content='width=320,initial-scale=1'>"
-                    "<style>body{font:14px sans-serif;margin:16px;text-align:center}"
-                    "input,button{width:90%%;padding:8px;margin:4px;border:1px solid #ccc;border-radius:4px;box-sizing:border-box}"
-                    "button{background:#2d7;color:#fff;border:none;font-size:16px;cursor:pointer}</style>"
-                    "</head><body><h2>RLCD 配置</h2>"
-                    "<a href='/scan' style='display:inline-block;width:90%%;padding:8px;margin:4px;background:#2d7;color:#fff;border-radius:4px;text-decoration:none;font-size:16px;box-sizing:border-box'>扫描 WiFi</a>"
-                    "<form action=/save method=post>"
-                    "<input name=ssid placeholder='WiFi 名称' value='%s'><br>"
-                    "<input type=password name=pass placeholder='WiFi 密码'><br>"
-                    "<button>保存并重启</button>"
-                    "</form></body></html>", sel_esc);
-                http_send(c, "200 OK", "text/html", body);
-            }
-        }
-        close(c);
-    }
-    close(srv);
-}
-
-/* 启动 AP 配网模式 */
-static void start_ap_provision(void)
-{
-    ESP_LOGI(TAG, "Starting AP provision...");
-    /* 先停掉 STA 自动重连, 否则重连与 WiFi 扫描抢射频, 导致扫描卡死/时好时坏 */
-    wifi_stop_sta_reconnect();
-    vTaskDelay(pdMS_TO_TICKS(200));
-    esp_netif_t *ap = esp_netif_create_default_wifi_ap();
-    if (!ap) { ESP_LOGE(TAG, "AP netif fail"); return; }
-    /* APSTA: STA 接口保留才能扫描 WiFi (纯 AP 模式无法 scan) */
-    esp_wifi_set_mode(WIFI_MODE_APSTA);
-    wifi_config_t wc = {};
-    memcpy(wc.ap.ssid, "RLCD-AP", 7);
-    wc.ap.ssid_len = 7;
-    wc.ap.max_connection = 4;
-    wc.ap.authmode = WIFI_AUTH_OPEN;
-    esp_wifi_set_config(WIFI_IF_AP, &wc);
-    esp_wifi_start();
-    ESP_LOGI(TAG, "AP 'RLCD-AP' started");
-
-    /* DNS 劫持 + HTTP 服务器 */
-    xTaskCreate(dns_task, "dns", 4096, NULL, 3, NULL);
-    xTaskCreate(http_task, "http", 12288, NULL, 3, NULL);
-    ESP_LOGI(TAG, "Services started");
-
-    /* 等待 5 分钟 */
-    for (int i = 0; i < 300; i++) vTaskDelay(pdMS_TO_TICKS(1000));
-    ESP_LOGI(TAG, "Timeout, restarting...");
-    esp_restart();
-}
-
-/* ===== 主入口 ===== */
 /* ===== Bridge UDP 自动发现 ===== */
 static void bridge_discovery_task(void *pv)
 {
@@ -847,6 +513,14 @@ static void bridge_discovery_task(void *pv)
             char *url = buf + 12;
             while (n > 12 && (url[n-13] == '\n' || url[n-13] == '\r')) url[--n - 12] = '\0';
             url[n - 12] = '\0';
+            /* 校验: 只接受 http(s):// 开头且长度合理的 URL. UDP:7777 无认证,
+             * 同网段任何设备都能发包, 加前缀/长度校验挡掉畸形或恶意内容 (SSRF/劫持数据源). */
+            size_t ulen = strlen(url);
+            if ((strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0)
+                || ulen < 11 || ulen >= 128) {
+                ESP_LOGW(TAG, "Discovery: reject invalid URL");
+                continue;
+            }
             /* 仅当 URL 变化时才写 NVS (防 Flash 磨损) */
             if (strcmp(url, last_url) != 0) {
                 strlcpy(last_url, url, sizeof(last_url));
@@ -858,6 +532,7 @@ static void bridge_discovery_task(void *pv)
     close(sock);
 }
 
+/* ===== 主入口 ===== */
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "=== RLCD Monitor Starting ===");
@@ -890,6 +565,26 @@ extern "C" void app_main(void)
     /* 3. 初始化 I2C (SHTC3 + RTC) */
     i2c_master_init();
 
+    /* 时区固定东八区 (与网络无关, 提前设好, 让 RTC/NTP/localtime 全程一致) */
+    setenv("TZ", "CST-8", 1);
+    tzset();
+
+    /* RTC: 板载 PCF85063 有电池保时. 开机先用它兜底系统时钟 (断网/夜间/掉电重启也有正确
+     * 时间), NTP 成功后再回写校准. */
+    pcf85063_init();
+    {
+        struct tm rtm;
+        if (pcf85063_read_time(&rtm) == ESP_OK) {
+            time_t rt = mktime(&rtm);
+            struct timeval tv = { .tv_sec = rt, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            ESP_LOGI(TAG, "RTC time restored: %04d-%02d-%02d %02d:%02d",
+                     rtm.tm_year + 1900, rtm.tm_mon + 1, rtm.tm_mday, rtm.tm_hour, rtm.tm_min);
+        } else {
+            ESP_LOGW(TAG, "RTC invalid/absent, will rely on NTP");
+        }
+    }
+
     /* 4. 初始化 UI */
     if (Lvgl_lock(-1)) {
         ui_init();
@@ -897,7 +592,7 @@ extern "C" void app_main(void)
         Lvgl_unlock();
     }
 
-    /* 初始化按键: 右键 GPIO0 (BOOT) + 左键 GPIO18, 均上拉输入, 低电平有效 */
+    /* 初始化按键: 右键 GPIO0 (BOOT) 循环切屏 + 左键 GPIO18 短按重启网络/长按重启设备. 均上拉输入, 低电平有效 */
     gpio_config_t io_conf;
     memset(&io_conf, 0, sizeof(io_conf));
     io_conf.intr_type = GPIO_INTR_DISABLE;
@@ -949,9 +644,7 @@ extern "C" void app_main(void)
     }
     if (wifi_ok) {
         ESP_LOGI(TAG, "WiFi connected!");
-        ntp_sync_time();
-        setenv("TZ", "CST-8", 1);
-        tzset();
+        if (ntp_sync_time() == ESP_OK) rtc_save_from_system();   /* 对时成功回写 RTC */
     } else {
         ESP_LOGW(TAG, "WiFi failed, AP mode");
         start_ap_provision();
@@ -967,6 +660,10 @@ extern "C" void app_main(void)
     /* 7. 创建数据锁 (必须在任务启动前) */
     s_data_mutex = xSemaphoreCreateMutex();
     if (!s_data_mutex) ESP_LOGE(TAG, "data mutex create fail");
+
+    /* 电源管理基线: 白天档 (关 light-sleep, 定频 160MHz — 行为与开机前一致).
+     * 夜间由 api_task 切到 light-sleep 档. */
+    pm_set_night(false);
 
     /* 8. 启动任务 */
     xTaskCreatePinnedToCore(sensor_task, "sensor", 4096, NULL, 3, NULL, 1);

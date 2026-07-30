@@ -57,6 +57,14 @@ esp_err_t wifi_radio_off(void);
 esp_err_t wifi_radio_on(void);
 
 /**
+ * @brief 手动重启射频 (左键短按重启网络用). 锁内完成 off→on 原子序列,
+ *        并在锁内重判夜间: 若此刻已进入夜间省电则跳过不重开射频.
+ * @param is_night_now 调用方 (ui_task) 此刻的 is_night() 判定
+ * @return ESP_OK 已重启; ESP_ERR_INVALID_STATE 夜间跳过
+ */
+esp_err_t wifi_restart_radio(bool is_night_now);
+
+/**
  * @brief 是否处于夜间省电态 (射频已停). UI 据此显示"省电"而非"WiFi:NO".
  */
 bool wifi_is_night_sleep(void);
@@ -66,6 +74,7 @@ const char *wifi_get_ip(void);      /* 本机 IP 字符串 */
 const char *wifi_get_ssid(void);    /* 当前 SSID */
 int wifi_get_rssi(void);            /* RSSI dBm (负值), 未连接=0 */
 int wifi_get_channel(void);         /* 信道, 未连接=0 */
+void wifi_get_ap_info(int *rssi, int *channel);  /* 一次取回 RSSI+信道 (合并查询, 省一次 ap_info) */
 
 /**
  * @brief 同步 NTP 时间

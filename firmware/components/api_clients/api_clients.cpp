@@ -13,6 +13,8 @@
 #include <esp_http_client.h>
 #include <esp_crt_bundle.h>
 #include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <nvs_flash.h>
 #include <nvs.h>
 #include <cJSON.h>
@@ -25,13 +27,22 @@ static const char *TAG = "API";
 /* Bridge URL 更新标志 — api_task 轮询此标志, 发现变化立即重拉数据 */
 volatile int g_bridge_url_changed = 0;
 
-/* ===== Default fund codes ===== */
-static const char *s_fund_codes[] = {
-    "007280",  /* 摩根日本精选股票(QDII)A */
-    "019172",  /* 摩根纳斯达克100指数(QDII)人民币A */
-    "270023",  /* 广发全球精选股票(QDII)人民币A */
+/* ===== 预置基金列表 (代码 + 默认名, 单一数据源) =====
+ * 原来代码在 api 层、中文名在 ui_main.cpp 各存一份, 容易不一致. 合并到这里,
+ * UI 经 api_fund_default_name() 取名 (API 返回 SHORTNAME 时优先用返回值). */
+typedef struct { const char *code; const char *name; } FundDef_t;
+static const FundDef_t s_funds[] = {
+    {"007280", "摩根日本精选股票(QDII)A"},
+    {"019172", "摩根纳斯达克100指数(QDII)"},
+    {"270023", "广发全球精选股票(QDII)"},
 };
-static int s_fund_count = 3;
+static const int s_fund_count = (int)(sizeof(s_funds) / sizeof(s_funds[0]));
+
+int api_fund_count(void) { return s_fund_count; }
+const char *api_fund_default_name(int i)
+{
+    return (i >= 0 && i < s_fund_count) ? s_funds[i].name : "";
+}
 
 /* ===== HTTP GET over raw socket ===== */
 static char *http_get(const char *url)
@@ -40,7 +51,7 @@ static char *http_get(const char *url)
     const char *hp = strstr(url, "://");
     if (!hp) return NULL;
     hp += 3;
-    char host[64] = {0}, port_str[8] = "80", path[256] = {0};
+    char host[64] = {0}, port_str[8] = "80", path[512] = {0};
     int i = 0;
     while (*hp && *hp != '/' && *hp != ':' && i < 63) host[i++] = *hp++;
     if (*hp == ':') {
@@ -48,6 +59,7 @@ static char *http_get(const char *url)
         int pi = 0;
         while (*hp && *hp != '/' && pi < 6) port_str[pi++] = *hp++;
         port_str[pi] = '\0';
+        if (port_str[0] == '\0') strlcpy(port_str, "80", sizeof(port_str));  /* 畸形 URL ":/": 回填默认端口 */
     }
     if (*hp) strlcpy(path, hp, sizeof(path));
     else strlcpy(path, "/", sizeof(path));
@@ -71,11 +83,17 @@ static char *http_get(const char *url)
     }
     freeaddrinfo(res);
 
-    char req[512];
+    char req[768];
     int req_len = snprintf(req, sizeof(req),
         "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: ESP\r\nReferer: http://finance.sina.com.cn\r\n\r\n",
         path, host);
-    write(sock, req, req_len);
+    /* snprintf 截断时返回"本应写入长度"(可 >sizeof), 不 clamp 直接 write 会越界读栈. */
+    if (req_len < 0) { close(sock); return NULL; }
+    if (req_len >= (int)sizeof(req)) req_len = sizeof(req) - 1;
+    if (write(sock, req, req_len) != req_len) {
+        ESP_LOGW(TAG, "http_get: short write to %s", host);
+        close(sock); return NULL;
+    }
 
     /* 动态增长缓冲: 初始 8KB, 不足则翻倍, 上限 64KB (放 PSRAM, 省内部 RAM) */
     size_t cap = 8192;
@@ -254,8 +272,10 @@ esp_err_t api_fetch_gold(GoldData_t *out)
     if (!end) { free(resp); return ESP_FAIL; }
     *end = '\0';
 
+    /* 先解析到局部变量, 全部有效再写回 out — 避免非交易时段(Sina 返回空串或 0)
+     * 把 out 的旧值和错误涨跌混在一起当成功上报 */
     int field = 0;
-    float prev_close = 0;
+    float prev_close = 0, price = 0, high = 0, low = 0;
     char *tok = p;
     while (tok && *tok) {
         char *comma = strchr(tok, ',');
@@ -264,17 +284,28 @@ esp_err_t api_fetch_gold(GoldData_t *out)
         while (*val == ' ') val++;
         switch (field) {
             case 2: prev_close = (float)atof(val); break;  /* 昨收盘 */
-            case 3: { float v = (float)atof(val); if (v > 0.001f) out->high  = v; break; }
-            case 4: { float v = (float)atof(val); if (v > 0.001f) out->low   = v; break; }
-            case 6: { float v = (float)atof(val); if (v > 0.001f) out->price = v; break; }
+            case 3: { float v = (float)atof(val); if (v > 0.001f) high  = v; break; }
+            case 4: { float v = (float)atof(val); if (v > 0.001f) low   = v; break; }
+            case 6: { float v = (float)atof(val); if (v > 0.001f) price = v; break; }
         }
         tok = comma;
         field++;
     }
-    /* 循环结束后用本次价格统一计算涨跌 */
-    out->change = out->price - prev_close;
-    out->is_up = (out->change >= 0) ? 1 : 0;
     free(resp);
+
+    /* price 未拿到 → 本次无效, 返回 FAIL 让调用方保留上一次好数据 */
+    if (price <= 0.001f) {
+        ESP_LOGW(TAG, "Gold: no valid price (market closed?), keep old");
+        return ESP_FAIL;
+    }
+    out->price = price;
+    if (high > 0.001f) out->high = high;
+    if (low  > 0.001f) out->low  = low;
+    /* 仅在昨收盘也有效时才算涨跌; 否则不动旧涨跌, 避免出现 "涨跌额=整个价格" */
+    if (prev_close > 0.001f) {
+        out->change = price - prev_close;
+        out->is_up = (out->change >= 0) ? 1 : 0;
+    }
     ESP_LOGI(TAG, "Gold: %.2f h%.2f l%.2f", out->price, out->high, out->low);
     return ESP_OK;
 }
@@ -297,20 +328,30 @@ static char *https_get(const char *url, const char *header_key, const char *head
     if (!buf) { esp_http_client_cleanup(client); return NULL; }
     memset(buf, 0, 16384);
     esp_err_t err = esp_http_client_open(client, 0);
+    bool read_err = false;
     if (err == ESP_OK) {
         int cl = esp_http_client_fetch_headers(client);
-        int total = 0, n;
+        int total = 0, n = 0;
         while (total < 16383 && (n = esp_http_client_read(client, buf + total, 16383 - total)) > 0) {
             total += n;
         }
         buf[total] = '\0';
-        ESP_LOGI(TAG, "HTTPS OK: %s (%d bytes, cl=%d)", url, total, cl);
+        if (n < 0) {
+            /* TLS 中途出错: 得到半截 body, 解析必失败, 按失败处理而非误报成功 */
+            read_err = true;
+            ESP_LOGW(TAG, "HTTPS read error mid-stream: %s (%d bytes so far)", url, total);
+        } else if (total >= 16383) {
+            /* 触顶截断: body 超 16KB, 剩余被丢弃, JSON 多半不完整 */
+            ESP_LOGW(TAG, "HTTPS truncated at 16KB: %s (cl=%d)", url, cl);
+        } else {
+            ESP_LOGI(TAG, "HTTPS OK: %s (%d bytes, cl=%d)", url, total, cl);
+        }
     } else {
         ESP_LOGW(TAG, "HTTPS fail: %s (%s)", url, esp_err_to_name(err));
     }
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    if (err != ESP_OK || buf[0] == '\0') {
+    if (err != ESP_OK || read_err || buf[0] == '\0') {
         ESP_LOGW(TAG, "HTTPS no data: %s", url);
         free(buf);
         return NULL;
@@ -352,12 +393,12 @@ esp_err_t api_fetch_funds(FundItem_t *funds, int *count)
     /* 预置代码, 并记录哪些已成功 (供 Bridge 兜底判断) */
     bool ok[MAX_FUNDS] = { false };
     for (int i = 0; i < s_fund_count && i < MAX_FUNDS; i++)
-        strlcpy(funds[i].code, s_fund_codes[i], sizeof(funds[i].code));
+        strlcpy(funds[i].code, s_funds[i].code, sizeof(funds[i].code));
 
     /* 拼多基金查询: Fcodes=code1,code2,... */
     char codes[64] = {0};
     for (int i = 0; i < s_fund_count && i < MAX_FUNDS; i++) {
-        strlcat(codes, s_fund_codes[i], sizeof(codes));
+        strlcat(codes, s_funds[i].code, sizeof(codes));
         if (i + 1 < s_fund_count) strlcat(codes, ",", sizeof(codes));
     }
     char url[256];
@@ -411,17 +452,26 @@ esp_err_t api_fetch_funds(FundItem_t *funds, int *count)
     /* 未成功的基金逐个走 Bridge 兜底 */
     for (int i = 0; i < s_fund_count && i < MAX_FUNDS; i++) {
         if (ok[i] || funds[i].nav > 0.001f) continue;
-        if (fund_fetch_bridge(&funds[i], s_fund_codes[i])) got++;
+        if (fund_fetch_bridge(&funds[i], s_funds[i].code)) got++;
     }
 
     return (got > 0) ? ESP_OK : ESP_FAIL;
 }
 
-/* ===== Bridge URL 管理 (NVS 持久化, 免重新编译) ===== */
+/* ===== Bridge URL 管理 (NVS 持久化, 免重新编译) =====
+ * discovery_task 写 (set_bridge_url), api_task 读 (get_bridge_base / DeepSeek 回退),
+ * 两任务并发. s_bridge_url 是 128B 数组, strlcpy 非原子, 无锁会读到半新半旧的撕裂串.
+ * 用 mutex 串行化; 并发读路径改用 get_bridge_url_copy 在锁内拷到本地, 不再持逃逸指针. */
 static char s_bridge_url[128] = "";
+static SemaphoreHandle_t s_bridge_mutex = NULL;
+#define BRIDGE_LOCK()   do { if (s_bridge_mutex) xSemaphoreTake(s_bridge_mutex, portMAX_DELAY); } while (0)
+#define BRIDGE_UNLOCK() do { if (s_bridge_mutex) xSemaphoreGive(s_bridge_mutex); } while (0)
 
 const char *get_bridge_url(void)
 {
+    /* 首次调用发生在 app_main 启动早期 (单线程), 此时懒建锁无竞态 */
+    if (!s_bridge_mutex) s_bridge_mutex = xSemaphoreCreateMutex();
+    BRIDGE_LOCK();
     if (s_bridge_url[0] == '\0') {
         nvs_handle_t nvs;
         esp_err_t err = nvs_open("bridge", NVS_READONLY, &nvs);
@@ -435,12 +485,24 @@ const char *get_bridge_url(void)
             strlcpy(s_bridge_url, BRIDGE_URL, sizeof(s_bridge_url));
         }
     }
+    BRIDGE_UNLOCK();
     return s_bridge_url;
+}
+
+/* 锁内把当前 Bridge URL 拷到调用方缓冲, 供并发任务安全读取 */
+static void get_bridge_url_copy(char *buf, size_t sz)
+{
+    if (!buf || sz == 0) return;
+    get_bridge_url();          /* 确保已懒加载 + 锁已建 */
+    BRIDGE_LOCK();
+    strlcpy(buf, s_bridge_url, sz);
+    BRIDGE_UNLOCK();
 }
 
 static void get_bridge_base(char *buf, size_t sz)
 {
-    const char *url = get_bridge_url();
+    char url[128];
+    get_bridge_url_copy(url, sizeof(url));   /* 锁内拷本地, 避免与 set_bridge_url 竞争 */
     const char *s = strstr(url, "://");
     if (!s) { strlcpy(buf, url, sz); return; }
     s += 3;
@@ -459,7 +521,10 @@ void set_bridge_url(const char *url)
         nvs_set_str(nvs, "url", url);
         nvs_commit(nvs);
         nvs_close(nvs);
+        if (!s_bridge_mutex) s_bridge_mutex = xSemaphoreCreateMutex();
+        BRIDGE_LOCK();
         strlcpy(s_bridge_url, url, sizeof(s_bridge_url));
+        BRIDGE_UNLOCK();
         g_bridge_url_changed = 1;
         ESP_LOGI(TAG, "Bridge URL updated: %s", url);
     }
@@ -475,20 +540,28 @@ esp_err_t api_fetch_deepseek(DeepSeekData_t *out)
     if (resp) {
         cJSON *root = cJSON_Parse(resp); free(resp);
         if (root) {
+            /* 只有确实解析到 total_balance 才算成功; 否则 fall through 到 Bridge 兜底.
+             * (接口返回合法 JSON 但结构异常/错误体时, 不能报成功污染旧值) */
+            bool got = false;
             cJSON *infos = cJSON_GetObjectItem(root, "balance_infos");
             if (infos && cJSON_IsArray(infos) && cJSON_GetArraySize(infos) > 0) {
                 cJSON *info = cJSON_GetArrayItem(infos, 0);
                 cJSON *tb = cJSON_GetObjectItem(info, "total_balance");
-                if (tb && tb->valuestring) out->balance = (float)atof(tb->valuestring);
+                if (tb && tb->valuestring) { out->balance = (float)atof(tb->valuestring); got = true; }
             }
             cJSON_Delete(root);
-            ESP_LOGI(TAG, "DS direct: %.2f", out->balance);
-            return ESP_OK;
+            if (got) {
+                ESP_LOGI(TAG, "DS direct: %.2f", out->balance);
+                return ESP_OK;
+            }
+            ESP_LOGW(TAG, "DS direct: no total_balance, fallback to bridge");
         }
     }
 
     /* 回退 Bridge */
-    resp = http_get(get_bridge_url());
+    char bridge_url[128];
+    get_bridge_url_copy(bridge_url, sizeof(bridge_url));
+    resp = http_get(bridge_url);
     if (!resp) return ESP_FAIL;
     cJSON *root = cJSON_Parse(resp); free(resp);
     if (!root) return ESP_FAIL;

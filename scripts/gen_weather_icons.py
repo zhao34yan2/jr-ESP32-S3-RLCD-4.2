@@ -1,20 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-生成 LVGL v9 天气图标 (A8 alpha 位图), 实心黑色风格, 贴合 234.png.
+生成 LVGL v9 天气图标 (A8 alpha 位图), 线条描边(空心轮廓)风格, 贴合 HTML 预览.
 每个图标输出大(当前天气)/小(7天预报)两种尺寸.
-用 4x 超采样 + LANCZOS 缩小得到平滑边缘 (A8 保留灰度抗锯齿, 上屏时按阈值二值化).
+
+做法: 4x 超采样绘制实心 mask, 用形态学腐蚀相减得到"均匀宽度的外轮廓线"
+(云这种多圆重叠也能得到干净单一轮廓), 太阳光芒/雨/雪/雾等细节本就是线条直接保留;
+最后 LANCZOS 缩小得平滑抗锯齿边 (A8 保留灰度, 上屏按阈值二值化).
 
 输出: firmware/components/ui_app/fonts/weather_icons.c
 用法: python gen_weather_icons.py
 """
 import os
-from PIL import Image, ImageDraw
+import math
+from PIL import Image, ImageDraw, ImageChops, ImageFilter
 
 SS = 4  # 超采样倍数
 
 # 目标尺寸
 BIG_W, BIG_H = 78, 60
 SM_W,  SM_H  = 42, 34
+
+# 线宽 (超采样域像素). 最终线宽 ≈ STROKE / SS. 取 8 → 约 2px, 反射屏清晰不糊.
+STROKE = 8
 
 OUT = os.path.join(os.path.dirname(__file__),
                    "../firmware/components/ui_app/fonts/weather_icons.c")
@@ -29,35 +36,42 @@ def fill_ellipse(d, cx, cy, r, col=255):
     d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=col)
 
 
-def draw_cloud(d, w, h, cy_ratio=0.52, scale=1.0):
-    """实心云朵: 三个圆 + 底部矩形拼成经典云形. 返回云底 y (用于附加雨雪)."""
+def outline_of(mask, stroke=STROKE):
+    """实心 mask → 均匀宽度外轮廓线 (原图 - 腐蚀图)."""
+    eroded = mask
+    for _ in range(stroke):
+        eroded = eroded.filter(ImageFilter.MinFilter(3))
+    return ImageChops.subtract(mask, eroded)
+
+
+def draw_cloud_mask(w, h, cy_ratio=0.52, scale=1.0):
+    """实心云朵 mask: 三个圆 + 底部矩形拼成经典云形. 返回 (mask, 云底 y)."""
+    img, d = new_canvas(w, h)
     W, H = w * SS, h * SS
     cx = W * 0.5
     cy = H * cy_ratio
     base_r = H * 0.20 * scale
-    # 大圆(中) + 左右小圆 + 顶圆
     fill_ellipse(d, cx, cy, base_r * 1.15)
     fill_ellipse(d, cx - base_r * 1.15, cy + base_r * 0.35, base_r * 0.85)
     fill_ellipse(d, cx + base_r * 1.15, cy + base_r * 0.35, base_r * 0.85)
     fill_ellipse(d, cx - base_r * 0.35, cy - base_r * 0.55, base_r * 0.80)
     fill_ellipse(d, cx + base_r * 0.45, cy - base_r * 0.35, base_r * 0.70)
-    # 底部矩形拉平
     bottom = cy + base_r * 0.35 + base_r * 0.85
     d.rectangle([cx - base_r * 1.15, cy, cx + base_r * 1.15, bottom], fill=255)
-    return bottom
+    return img, bottom
 
 
 def icon_cloud(w, h):
-    img, d = new_canvas(w, h)
-    draw_cloud(d, w, h, cy_ratio=0.45)
-    return img
+    mask, _ = draw_cloud_mask(w, h, cy_ratio=0.45)
+    return outline_of(mask)
 
 
 def icon_fog(w, h):
-    img, d = new_canvas(w, h)
-    bottom = draw_cloud(d, w, h, cy_ratio=0.36, scale=0.92)
+    mask, bottom = draw_cloud_mask(w, h, cy_ratio=0.36, scale=0.92)
+    img = outline_of(mask)
+    d = ImageDraw.Draw(img)
     W, H = w * SS, h * SS
-    lw = int(H * 0.09)
+    lw = STROKE
     y1 = bottom + H * 0.10
     y2 = y1 + H * 0.16
     d.line([W * 0.20, y1, W * 0.80, y1], fill=255, width=lw)
@@ -65,9 +79,9 @@ def icon_fog(w, h):
     return img
 
 
-def _rain(img, d, w, h, bottom, n, length):
+def _rain(d, w, h, bottom, n, length):
     W, H = w * SS, h * SS
-    lw = int(H * 0.075)
+    lw = STROKE
     step = (W * 0.5) / n
     x0 = W * 0.5 - step * (n - 1) / 2
     for i in range(n):
@@ -77,64 +91,63 @@ def _rain(img, d, w, h, bottom, n, length):
 
 
 def icon_rain(w, h):
-    img, d = new_canvas(w, h)
-    bottom = draw_cloud(d, w, h, cy_ratio=0.34, scale=0.92)
-    _rain(img, d, w, h, bottom, 3, (h * SS) * 0.20)
+    mask, bottom = draw_cloud_mask(w, h, cy_ratio=0.34, scale=0.92)
+    img = outline_of(mask)
+    _rain(ImageDraw.Draw(img), w, h, bottom, 3, (h * SS) * 0.20)
     return img
 
 
 def icon_heavyrain(w, h):
-    img, d = new_canvas(w, h)
-    bottom = draw_cloud(d, w, h, cy_ratio=0.32, scale=0.90)
-    _rain(img, d, w, h, bottom, 4, (h * SS) * 0.24)
+    mask, bottom = draw_cloud_mask(w, h, cy_ratio=0.32, scale=0.90)
+    img = outline_of(mask)
+    _rain(ImageDraw.Draw(img), w, h, bottom, 4, (h * SS) * 0.24)
     return img
 
 
 def icon_snow(w, h):
-    img, d = new_canvas(w, h)
-    bottom = draw_cloud(d, w, h, cy_ratio=0.34, scale=0.92)
+    mask, bottom = draw_cloud_mask(w, h, cy_ratio=0.34, scale=0.92)
+    img = outline_of(mask)
+    d = ImageDraw.Draw(img)
     W, H = w * SS, h * SS
-    r = H * 0.045
+    r = H * 0.05
     for i, fx in enumerate([0.32, 0.5, 0.68]):
         y = bottom + H * (0.12 if i % 2 == 0 else 0.20)
-        fill_ellipse(d, W * fx, y, r)
+        fill_ellipse(d, W * fx, y, r)   # 雪点保持实心小圆
     return img
+
+
+def _sun_rays(d, cx, cy, r, lw, n=8, inner=1.35, outer=1.9):
+    for k in range(n):
+        a = math.pi * 2 * k / n
+        d.line([cx + math.cos(a) * r * inner, cy + math.sin(a) * r * inner,
+                cx + math.cos(a) * r * outer, cy + math.sin(a) * r * outer],
+               fill=255, width=lw)
 
 
 def icon_sun(w, h):
     img, d = new_canvas(w, h)
     W, H = w * SS, h * SS
     cx, cy = W * 0.5, H * 0.5
-    r = H * 0.22
-    fill_ellipse(d, cx, cy, r)
-    lw = int(H * 0.06)
-    import math
-    for k in range(8):
-        a = math.pi * 2 * k / 8
-        x1 = cx + math.cos(a) * r * 1.5
-        y1 = cy + math.sin(a) * r * 1.5
-        x2 = cx + math.cos(a) * r * 2.0
-        y2 = cy + math.sin(a) * r * 2.0
-        d.line([x1, y1, x2, y2], fill=255, width=lw)
+    r = H * 0.20
+    lw = STROKE
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=255, width=lw)  # 空心圆
+    _sun_rays(d, cx, cy, r, lw)
     return img
 
 
 def icon_partly(w, h):
     img, d = new_canvas(w, h)
     W, H = w * SS, h * SS
-    # 太阳在左上
+    lw = STROKE
+    # 太阳环在左上
     cx, cy = W * 0.34, H * 0.34
-    r = H * 0.16
-    fill_ellipse(d, cx, cy, r)
-    lw = int(H * 0.05)
-    import math
-    for k in range(8):
-        a = math.pi * 2 * k / 8
-        d.line([cx + math.cos(a) * r * 1.4, cy + math.sin(a) * r * 1.4,
-                cx + math.cos(a) * r * 1.9, cy + math.sin(a) * r * 1.9],
-               fill=255, width=lw)
-    # 云盖在右下(先清除云占位区避免光芒穿透太多, 再画云)
-    draw_cloud(d, w, h, cy_ratio=0.58, scale=0.82)
+    r = H * 0.15
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=255, width=lw)
+    _sun_rays(d, cx, cy, r, lw, inner=1.35, outer=1.85)
+    # 云 (实心 mask) 盖右下: 先把云覆盖区的太阳线抹掉, 再叠云轮廓
+    cloud_mask, _ = draw_cloud_mask(w, h, cy_ratio=0.60, scale=0.82)
+    img = ImageChops.subtract(img, cloud_mask)          # 挖空被云遮住的太阳线
+    img = ImageChops.lighter(img, outline_of(cloud_mask))  # 叠加云轮廓
     return img
 
 
@@ -151,8 +164,7 @@ ICONS = {
 
 def render(fn, w, h):
     img = fn(w, h)
-    img = img.resize((w, h), Image.LANCZOS)
-    return img
+    return img.resize((w, h), Image.LANCZOS)
 
 
 def emit_img(f, name, img):
@@ -177,7 +189,7 @@ def emit_img(f, name, img):
 
 def main():
     with open(OUT, "w", encoding="utf-8") as f:
-        f.write("/* Auto-generated weather icons (A8) — gen_weather_icons.py */\n")
+        f.write("/* Auto-generated weather icons (A8, 线条描边) — gen_weather_icons.py */\n")
         f.write("#include \"lvgl.h\"\n\n")
         for key, fn in ICONS.items():
             emit_img(f, f"wi_{key}_big", render(fn, BIG_W, BIG_H))

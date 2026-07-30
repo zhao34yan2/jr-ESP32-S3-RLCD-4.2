@@ -59,7 +59,6 @@ typedef struct {
     float month_tokens_m;    /* 本月 tokens (百万) */
     float month_cost;        /* 本月费用 (¥) */
     float cache_hit_rate;    /* 缓存命中率 (0~1) */
-    float budget_pct;        /* 预算使用率 (0~1) */
 } DeepSeekData_t;
 
 /* 应用全局数据 */
@@ -106,6 +105,10 @@ esp_err_t api_fetch_gold(GoldData_t *out);
  * @param count 输出数量
  */
 esp_err_t api_fetch_funds(FundItem_t *funds, int *count);
+
+/* 预置基金列表 (代码+默认名 单一数据源, 定义在 api_clients.cpp) */
+int api_fund_count(void);                  /* 预置基金数 */
+const char *api_fund_default_name(int i);  /* 第 i 支默认中文名 (API 未返回名称时的兜底) */
 
 /* Bridge URL 更新标志 (api_task 轮询后重拉基金/DS) */
 extern volatile int g_bridge_url_changed;

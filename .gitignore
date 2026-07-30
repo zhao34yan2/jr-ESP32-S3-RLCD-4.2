@@ -13,6 +13,9 @@ scripts/node.exe
 *.log
 # 本地工具 (含本机绝对路径/串口号, 不入库)
 .vscode/
-firmware/_build_tmp.bat
-firmware/_flash_tmp.bat
-firmware/_monitor_tmp.bat
+firmware/_*.bat
+firmware/_*.py
+_flash.bat
+firmware/sdkconfig.bak*
+# 参考 PDF (体积大, 不入库)
+*.pdf

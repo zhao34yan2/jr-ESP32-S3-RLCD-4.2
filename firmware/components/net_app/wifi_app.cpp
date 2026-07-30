@@ -6,6 +6,7 @@
 #include <cstring>
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
+#include <freertos/semphr.h>
 #include <esp_log.h>
 #include <esp_wifi.h>
 #include <esp_netif.h>
@@ -13,6 +14,13 @@
 #include "wifi_app.h"
 
 static const char *TAG = "NET";
+
+/* 射频操作互斥锁: 串行化所有复合 esp_wifi_* 序列 (stop/start/connect/set_config).
+ * api_task(夜间省电开关/重连) 与 ui_task(短按重启网络) 会并发进这些序列, 无锁时
+ * 两任务同时 stop+start 在部分 IDF 上会 assert/状态错乱. 所有对外射频函数入口取此锁. */
+static SemaphoreHandle_t s_radio_mutex = NULL;
+#define RADIO_LOCK()    do { if (s_radio_mutex) xSemaphoreTake(s_radio_mutex, portMAX_DELAY); } while (0)
+#define RADIO_UNLOCK()  do { if (s_radio_mutex) xSemaphoreGive(s_radio_mutex); } while (0)
 
 /* NTP 服务器 */
 #define NTP_SERVER1 "pool.ntp.org"
@@ -40,13 +48,18 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         /* 打印断连原因码, 用于区分网络问题(找不到AP)还是配置问题(密码错) */
         wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
         ESP_LOGW(TAG, "STA disconnected, reason=%d", d ? d->reason : -1);
+        /* 断连即视为 IP 失效, 清掉旧 IP, 免得监控屏显示过期地址 */
+        strlcpy(s_ip_str, "0.0.0.0", sizeof(s_ip_str));
         if (!s_reconnect_enabled) {
             /* 配网模式: 不再重连, 让射频空出来给扫描 */
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         } else if (s_retry_count < 5) {
-            esp_wifi_connect();
+            esp_err_t ce = esp_wifi_connect();
             s_retry_count++;
-            ESP_LOGW(TAG, "WiFi disconnect, retry %d", s_retry_count);
+            if (ce != ESP_OK)
+                ESP_LOGW(TAG, "esp_wifi_connect ret %s (retry %d)", esp_err_to_name(ce), s_retry_count);
+            else
+                ESP_LOGW(TAG, "WiFi disconnect, retry %d", s_retry_count);
         } else {
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             ESP_LOGE(TAG, "WiFi connection failed after 5 retries");
@@ -63,6 +76,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 /* ===== 初始化 WiFi STA ===== */
 void wifi_init_sta(const char *ssid, const char *password)
 {
+    if (!s_radio_mutex) s_radio_mutex = xSemaphoreCreateMutex();
     s_wifi_event_group = xEventGroupCreate();
 
     ESP_ERROR_CHECK(esp_netif_init());
@@ -139,6 +153,20 @@ int wifi_get_channel(void)
     return 0;
 }
 
+/* 一次 esp_wifi_sta_get_ap_info 同时取回 RSSI + 信道 (监控屏原来分两次调用, 合并省一次).
+ * 任一出参可为 NULL; 未连接时输出 0. */
+void wifi_get_ap_info(int *rssi, int *channel)
+{
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        if (rssi)    *rssi    = ap.rssi;
+        if (channel) *channel = ap.primary;
+    } else {
+        if (rssi)    *rssi    = 0;
+        if (channel) *channel = 0;
+    }
+}
+
 void wifi_check_reconnect(void)
 {
     if (!s_reconnect_enabled) return;  /* 配网模式下不重连 */
@@ -148,9 +176,18 @@ void wifi_check_reconnect(void)
         uint32_t now = xTaskGetTickCount() / pdMS_TO_TICKS(1000);
         if (now - last_try > 120) {  /* 每2分钟尝试重连一次 */
             last_try = now;
-            s_retry_count = 0;
-            ESP_LOGW(TAG, "WiFi auto reconnect...");
-            esp_wifi_connect();
+            /* 持射频锁再 connect: 避免与 ui_task 的 wifi_restart_radio (off→on)
+             * 交错, 否则可能在 stop 与 start 之间插入 connect 触发驱动状态错乱 */
+            if (s_radio_mutex && xSemaphoreTake(s_radio_mutex, portMAX_DELAY) == pdTRUE) {
+                if (!s_night_sleep && !wifi_is_connected()) {
+                    s_retry_count = 0;
+                    ESP_LOGW(TAG, "WiFi auto reconnect...");
+                    esp_err_t cerr = esp_wifi_connect();
+                    if (cerr != ESP_OK)
+                        ESP_LOGW(TAG, "auto reconnect esp_wifi_connect ret %s", esp_err_to_name(cerr));
+                }
+                xSemaphoreGive(s_radio_mutex);
+            }
         }
     }
 }
@@ -184,24 +221,29 @@ void wifi_switch_network(const char *ssid, const char *password)
     ESP_LOGI(TAG, "Switching to fallback WiFi: %s", ssid);
 }
 
-/* 夜间省电: 停 WiFi 射频 (关掉最大耗电源). 不销毁驱动/netif, 只是 esp_wifi_stop,
- * 早上 wifi_radio_on 里 esp_wifi_start 即可恢复, 全程 CPU 不睡, 无唤醒风险. */
-esp_err_t wifi_radio_off(void)
+/* ── 射频操作互斥: 以下 _locked 版假定调用者已持有 s_radio_mutex ── */
+
+/* 夜间省电核心: 停 WiFi 射频. 假定已持锁. */
+static esp_err_t wifi_radio_off_locked(void)
 {
     if (s_night_sleep) return ESP_OK;      /* 已在夜间态, 幂等 */
-    s_night_sleep = true;
     s_retry_count = 99;                    /* 事件处理里不再触发重连 */
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     esp_sntp_stop();                       /* 停 SNTP, 否则夜间无网仍后台发包/刷失败日志 */
     esp_wifi_disconnect();
     esp_err_t err = esp_wifi_stop();       /* 关射频 (省电大头) */
+    if (err != ESP_OK) {
+        /* stop 失败: 不置夜间态, 让调用方下轮重试, 否则会"标记夜间但射频还开着"整夜耗电 */
+        ESP_LOGE(TAG, "Night mode: esp_wifi_stop fail (%s), will retry", esp_err_to_name(err));
+        return err;
+    }
+    s_night_sleep = true;                  /* 确认射频已停, 才进夜间态 */
     ESP_LOGI(TAG, "Night mode: WiFi radio stopped (power save)");
     return err;
 }
 
-/* 白天恢复: 重开 WiFi 射频并重连. 返回 ESP_OK 表示 start 成功 (连接由事件异步完成).
- * 若 start 失败, 保持夜间态标志由调用方决定是否下轮重试, 不会卡死. */
-esp_err_t wifi_radio_on(void)
+/* 白天恢复核心: 重开 WiFi 射频并重连. 假定已持锁. */
+static esp_err_t wifi_radio_on_locked(void)
 {
     if (!s_night_sleep) return ESP_OK;     /* 本就在白天态 */
     esp_err_t err = esp_wifi_start();      /* 重开射频 */
@@ -211,9 +253,55 @@ esp_err_t wifi_radio_on(void)
     }
     s_night_sleep = false;
     s_retry_count = 0;
-    esp_wifi_connect();                    /* STA_START 事件也会触发, 这里再补一次无害 */
+    esp_err_t cerr = esp_wifi_connect();   /* STA_START 事件也会触发, 这里再补一次无害 */
+    if (cerr != ESP_OK)
+        ESP_LOGW(TAG, "Day resume: esp_wifi_connect ret %s", esp_err_to_name(cerr));
     ESP_LOGI(TAG, "Day mode: WiFi radio resumed");
     return ESP_OK;
+}
+
+/* 夜间省电: 停 WiFi 射频. 公开接口, 加锁串行化, 供 api_task 调用. */
+esp_err_t wifi_radio_off(void)
+{
+    esp_err_t err = ESP_OK;
+    if (s_radio_mutex && xSemaphoreTake(s_radio_mutex, portMAX_DELAY) == pdTRUE) {
+        err = wifi_radio_off_locked();
+        xSemaphoreGive(s_radio_mutex);
+    }
+    return err;
+}
+
+/* 白天恢复: 重开 WiFi 射频. 公开接口, 加锁串行化, 供 api_task 调用. */
+esp_err_t wifi_radio_on(void)
+{
+    esp_err_t err = ESP_OK;
+    if (s_radio_mutex && xSemaphoreTake(s_radio_mutex, portMAX_DELAY) == pdTRUE) {
+        err = wifi_radio_on_locked();
+        xSemaphoreGive(s_radio_mutex);
+    }
+    return err;
+}
+
+/* 手动重启射频 (左键短按). 持锁内完成 off→on 原子序列, 并在锁内重判夜间:
+ * 若此刻 api_task 已切入夜间省电(射频主动关), 则不重开, 避免"整夜射频被短按打开
+ * 且状态机脱钩"的竞态 (原 ui_task 无锁 off()+on() 会踩这个坑). */
+esp_err_t wifi_restart_radio(bool is_night_now)
+{
+    esp_err_t err = ESP_OK;
+    if (s_radio_mutex && xSemaphoreTake(s_radio_mutex, portMAX_DELAY) == pdTRUE) {
+        if (is_night_now || s_night_sleep) {
+            /* 夜间: 不碰射频, 交由 api_task 的省电状态机统一管理 */
+            ESP_LOGW(TAG, "restart_radio skipped (night power-save)");
+            err = ESP_ERR_INVALID_STATE;
+        } else {
+            /* 白天: off→on 原子重启. off_locked 会置 s_night_sleep=true,
+             * on_locked 再清回, 全程持锁, api_task 看不到中间态 */
+            wifi_radio_off_locked();
+            err = wifi_radio_on_locked();
+        }
+        xSemaphoreGive(s_radio_mutex);
+    }
+    return err;
 }
 
 /* ===== NTP 时间同步 ===== */
