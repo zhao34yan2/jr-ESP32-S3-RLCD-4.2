@@ -279,14 +279,11 @@ void ui_update_all(const AppData_t *app)
 
     /* 电池文字 + 填充宽度 */
     if (l_batt) {
-        int pct;
-        if (app->bat_drop_per_h < 0) {
-            pct = app->bat_charge_pct;
-            snprintf(buf, sizeof(buf), "充电 %d%%", pct);
-        } else {
-            pct = app->battery_pct;
-            snprintf(buf, sizeof(buf), "电量 %d%%", pct);
-        }
+        /* 始终显示实时 ADC 电量 (充电时也随电压缓慢变化, 不再冻结成插线快照).
+         * 充电中/满的精确判定需硬件 STAT 脚, 本板未引到 GPIO, 只能看板载绿灯 CHG. */
+        int pct = app->battery_pct;
+        bool charging = (app->bat_drop_per_h < 0);
+        snprintf(buf, sizeof(buf), charging ? "充电 %d%%" : "电量 %d%%", pct);
         ui_set_label(l_batt, buf);
         if (batt_fill) {
             int w = 20 * (pct < 0 ? 0 : pct > 100 ? 100 : pct) / 100;

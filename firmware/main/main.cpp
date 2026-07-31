@@ -339,6 +339,9 @@ static void ui_task(void *pv)
     TickType_t toast_hide = 0;
     /* 短按重启网络: 锁内只建提示+置标志, 出锁后再做阻塞式射频操作 (避免持 LVGL 锁调 esp_wifi_stop/start) */
     bool       net_restart_pending = false;
+    /* 右键切屏意图: 锁外置位, 锁内消费后清零. 若某轮 Lvgl_lock 超时(反射屏全屏刷新占锁),
+     * 标志保留到下一轮再切, 不会随一次性边沿丢失 (与 net_restart_pending 同款做法). */
+    bool       page_switch_pending = false;
 
     while (1) {
         /* KEY检测 (在锁外也可以读GPIO) */
@@ -359,7 +362,6 @@ static void ui_task(void *pv)
                 g_app_data.bat_drop_per_h = bat_tmp.bat_drop_per_h;
                 g_app_data.bat_est_hours  = bat_tmp.bat_est_hours;
                 g_app_data.bat_log_count  = bat_tmp.bat_log_count;
-                g_app_data.bat_charge_pct = bat_tmp.bat_charge_pct;
                 DATA_UNLOCK();
             } else {
                 ESP_LOGW(TAG, "ADC battery read failed, keep last value");
@@ -375,6 +377,7 @@ static void ui_task(void *pv)
         bool page_edge  = (key && !g_key_last);      /* 右键下降沿: 切屏 */
         bool long_fire  = false;                     /* 左键长按到点: 重启设备 */
         bool short_fire = false;                     /* 左键短按松开: 重启网络 */
+        if (page_edge) page_switch_pending = true;   /* 边沿转成待处理标志, 拿不到锁也不丢 */
         if (key2) {
             key2_hold++;
             /* >= 而非 == : key2_hold 在锁外自增, 若到点那轮恰好拿不到锁,
@@ -390,8 +393,9 @@ static void ui_task(void *pv)
 
         if (Lvgl_lock(100)) {
             bool page_switched = false;
-            /* 右键: 循环切屏 0→1→2→0 */
-            if (page_edge) {
+            /* 右键: 循环切屏 0→1→2→0 (消费待处理标志, 消费成功才清零) */
+            if (page_switch_pending) {
+                page_switch_pending = false;
                 g_page = (g_page + 1) % PAGE_COUNT;
                 lv_scr_load_anim(screen_for_page(g_page),
                                   LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);

@@ -25,10 +25,12 @@ static const char *TAG = "BAT";
  *         -> ×分压比 -> 电池 mV -> Li-ion 电压曲线插值 -> 电量%.
  * 旧版直接用原始码值套魔法表, 不同芯片/批次会系统性偏; 改为校准电压后逐芯片准.
  *
- * BAT_DIVIDER=3: 本板 (Waveshare ESP32-S3-RLCD-4.2) 硬件分压设计值. 4.2V 电池经 /3
- * 得 ~1.4V 落在 12dB 衰减线性量程内. 若要更准可两点实测校正: 用万用表量已知电池电压,
- * 对照下方 ESP_LOGI 打印的电池 mV, 比例 = 电池实测电压 / 打印值, 乘到 BAT_DIVIDER 上. */
-#define BAT_DIVIDER  3
+ * BAT_DIVIDER: 本板 (Waveshare ESP32-S3-RLCD-4.2) 分压系数, 已单点校准.
+ * 设计值 3 (4.2V 电池经 /3 得 ~1.4V, 落在 12dB 衰减线性量程内), 但实测偏低:
+ * 充满(CHG 绿灯熄灭)时 ADC 只读 4018mV, 真实应 ~4200mV, 故 ×(4200/4018)=1.0453,
+ * 修正为 3×1.0453≈3.136. 若换电池/换板不准, 可再单点校正: 充满时看串口 batt mV,
+ * 系数 = 4200 / 打印值, 乘到此处. (STAT 未引到 GPIO, 满电只能靠板载绿灯判断) */
+#define BAT_DIVIDER  3.136f
 
 static adc_oneshot_unit_handle_t s_adc_handle  = NULL;
 static adc_cali_handle_t         s_cali_handle = NULL;
@@ -72,7 +74,7 @@ static int battery_read_mv(void)
         int raw = 0, pin_mv = 0;
         if (adc_oneshot_read(s_adc_handle, ADC_CHANNEL_3, &raw) == ESP_OK &&
             adc_cali_raw_to_voltage(s_cali_handle, raw, &pin_mv) == ESP_OK) {
-            mv[n++] = pin_mv * BAT_DIVIDER;
+            mv[n++] = (int)(pin_mv * BAT_DIVIDER + 0.5f);
         }
         vTaskDelay(pdMS_TO_TICKS(2));
     }
@@ -127,7 +129,7 @@ int battery_read_pct(void)
 static int32_t s_bat_log_count = 0;  /* 已采样次数 (>=2 才出趋势) */
 static int s_bat_peak_pct = -1;      /* 最高电量 (充满基准) */
 static uint32_t s_bat_peak_ts = 0;
-static int s_chg_reported = -1;      /* 已上报的充电电量 */
+static int s_prev_pct = -1;          /* 上一轮电量 (判电量是否回升=充电) */
 
 void battery_nvs_cleanup(void)
 {
@@ -174,32 +176,30 @@ static void battery_calc_trend(AppData_t *app)
     uint32_t now = (uint32_t)time(NULL);
     int dropped = s_bat_peak_pct - app->battery_pct;
 
-    /* 检测充电: 电量比上次高 = 在充电 (即使峰值更高) */
-    static int s_prev_pct = -1;
-    int is_charging = (dropped <= 0);
-    if (!is_charging && s_prev_pct >= 0 && app->battery_pct > s_prev_pct + 2) {
-        is_charging = true;  /* 电量回升超过2% = 充电 */
-    }
-
+    /* 检测充电: 唯一可靠信号是"电量真的回升"(充电会抬高电压 -> pct 上升).
+     * 硬件 STAT 未引到 GPIO, 无法直读充电状态; 原先的 dropped<=0(在峰值即判充电)会在
+     * 满电/刚拔线时误报, 已去掉, 只保留回升判据. 用插电前电量(prev)作起始, 充满才跳100. */
+    int prev_pct = s_prev_pct;   /* 先存旧值: 下面要用"插电前"电量, 不能被当前值覆盖 */
     s_prev_pct = app->battery_pct;
+    bool is_charging = (prev_pct >= 0 && app->battery_pct > prev_pct + 2);
 
     if (is_charging) {
-        /* 充电中: 用插电前的电量作为起始值, 充满才跳100% */
-        if (s_chg_reported < 0) {
-            s_chg_reported = (s_prev_pct >= 0) ? s_prev_pct : app->battery_pct;
-        }
-        if (app->battery_pct >= 98) s_chg_reported = 100;
-        app->bat_charge_pct = (s_chg_reported > 100) ? 100 : s_chg_reported;
-        app->bat_drop_per_h = -1;
+        app->bat_drop_per_h = -1;   /* -1 = 充电中 (UI 据此显示"充电") */
         app->bat_est_hours = 999;
         return;
     }
-    /* 放电时重置充电状态 */
-    s_chg_reported = -1;
+
+    /* 时间回退保护: now/peak_ts 均 uint32, 若 NTP 校时往回拨导致 now < peak_ts,
+     * 相减会下溢成巨大值 -> elapsed_h 巨大 -> 趋势失真. 此时以当前为新峰值基准重来. */
+    if (now < s_bat_peak_ts) {
+        s_bat_peak_ts = now;
+        app->bat_drop_per_h = 0;
+        return;
+    }
 
     float elapsed_h = (float)(now - s_bat_peak_ts) / 3600.0f;
     if (elapsed_h < 0.5f) { /* 刚拔USB不到30分钟, 数据太少 (Li-ion电压还稳定) */
-        app->bat_drop_per_h = -1;
+        app->bat_drop_per_h = 0;   /* 0 = 无趋势(非充电); 不再用 -1, 避免误显示"充电中" */
         return;
     }
 

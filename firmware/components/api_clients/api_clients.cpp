@@ -44,6 +44,23 @@ const char *api_fund_default_name(int i)
     return (i >= 0 && i < s_fund_count) ? s_funds[i].name : "";
 }
 
+/* UTF-8 安全拷贝: 与 strlcpy 类似, 但截断时回退到完整字符边界, 不会把多字节汉字
+ * 切成半个 (否则 UI 末字乱码). dst 始终以 '\0' 结尾. */
+static void utf8_lcpy(char *dst, const char *src, size_t dstsz)
+{
+    if (dstsz == 0) return;
+    size_t n = 0;
+    while (src[n] && n < dstsz - 1) n++;
+    /* 若正好停在一个多字节序列中间 (下一字节是 0x80..0xBF 续接字节),
+     * 往回退到该序列起始, 丢掉这个不完整字符 */
+    if (src[n] && (src[n] & 0xC0) == 0x80) {
+        while (n > 0 && (src[n] & 0xC0) == 0x80) n--;  /* 退到续接字节之前 */
+        /* n 现在指向该字符的首字节, 丢掉它 */
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
 /* ===== HTTP GET over raw socket ===== */
 static char *http_get(const char *url)
 {
@@ -197,15 +214,17 @@ esp_err_t api_fetch_weather(WeatherData_t *out)
     cJSON *day = cJSON_GetObjectItem(root, "daily");
     if (cur && day) {
         cJSON *item;
-        if ((item = cJSON_GetObjectItem(cur, "temperature_2m")))
+        /* 均先判 IsNumber: 上游字段变字符串/null 时 valuedouble=0, 否则会静默当 0 写入
+         * (温度 0℃ / 湿度 0 / 天气 code 0→"晴"), 判类型后不满足则保留旧值 */
+        if ((item = cJSON_GetObjectItem(cur, "temperature_2m")) && cJSON_IsNumber(item))
             out->temp_outdoor = (float)item->valuedouble;
-        if ((item = cJSON_GetObjectItem(cur, "relative_humidity_2m")))
+        if ((item = cJSON_GetObjectItem(cur, "relative_humidity_2m")) && cJSON_IsNumber(item))
             out->humidity = (int)item->valuedouble;
-        if ((item = cJSON_GetObjectItem(cur, "apparent_temperature")))
+        if ((item = cJSON_GetObjectItem(cur, "apparent_temperature")) && cJSON_IsNumber(item))
             out->apparent_temp = (float)item->valuedouble;
-        if ((item = cJSON_GetObjectItem(cur, "wind_speed_10m")))
+        if ((item = cJSON_GetObjectItem(cur, "wind_speed_10m")) && cJSON_IsNumber(item))
             out->wind_level = kmh_to_wind_level((float)item->valuedouble);
-        if ((item = cJSON_GetObjectItem(cur, "weather_code"))) {
+        if ((item = cJSON_GetObjectItem(cur, "weather_code")) && cJSON_IsNumber(item)) {
             int w = (int)item->valuedouble;
             out->code = w;
             strlcpy(out->condition, code_to_cond(w), sizeof(out->condition));
@@ -315,7 +334,9 @@ static char *https_get(const char *url, const char *header_key, const char *head
 {
     esp_http_client_config_t cfg = {0};
     cfg.url = url; cfg.timeout_ms = 10000; cfg.buffer_size = 16384;
-    cfg.skip_cert_common_name_check = true;
+    /* 挂 ESP-IDF 内置 CA 证书 bundle 校验服务器身份, 防中间人窃取 DeepSeek API Key.
+     * 之前只 skip_cert_common_name_check 而不设 bundle, esp-tls 会退化成 VERIFY_NONE(加密但不验身份). */
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
     ESP_LOGI(TAG, "HTTPS connecting: %.50s", url);
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) return NULL;
@@ -331,12 +352,17 @@ static char *https_get(const char *url, const char *header_key, const char *head
     bool read_err = false;
     if (err == ESP_OK) {
         int cl = esp_http_client_fetch_headers(client);
+        int status = esp_http_client_get_status_code(client);
         int total = 0, n = 0;
         while (total < 16383 && (n = esp_http_client_read(client, buf + total, 16383 - total)) > 0) {
             total += n;
         }
         buf[total] = '\0';
-        if (n < 0) {
+        if (status < 200 || status >= 300) {
+            /* 非 2xx: 拿到的是错误体(401/403/429/5xx), 当失败处理, 避免白解析错误体+误打 "OK" */
+            read_err = true;
+            ESP_LOGW(TAG, "HTTPS bad status %d: %s", status, url);
+        } else if (n < 0) {
             /* TLS 中途出错: 得到半截 body, 解析必失败, 按失败处理而非误报成功 */
             read_err = true;
             ESP_LOGW(TAG, "HTTPS read error mid-stream: %s (%d bytes so far)", url, total);
@@ -376,8 +402,10 @@ static bool fund_fetch_bridge(FundItem_t *f, const char *code)
     if (!br) { ESP_LOGW(TAG, "Bridge: JSON parse fail"); return false; }
     bool ok = false;
     cJSON *item = cJSON_GetObjectItem(br, "nav");
-    if (item) { f->nav = (float)item->valuedouble; ok = true; }
-    else ESP_LOGW(TAG, "Bridge: no nav field");
+    /* 与主接口路径一致: 必须是有效数值且 >0.001 才算成功, 否则 nav=0 会被当成功上报 */
+    if (item && cJSON_IsNumber(item) && item->valuedouble > 0.001) {
+        f->nav = (float)item->valuedouble; ok = true;
+    } else ESP_LOGW(TAG, "Bridge: no valid nav field");
     cJSON_Delete(br);
     return ok;
 }
@@ -430,7 +458,7 @@ esp_err_t api_fetch_funds(FundItem_t *funds, int *count)
                     FundItem_t *f = &funds[idx];
                     cJSON *it;
                     if ((it = cJSON_GetObjectItem(d, "SHORTNAME")) && cJSON_IsString(it))
-                        strlcpy(f->name, it->valuestring, sizeof(f->name));
+                        utf8_lcpy(f->name, it->valuestring, sizeof(f->name));
                     if ((it = cJSON_GetObjectItem(d, "NAV")) && cJSON_IsString(it) && it->valuestring[0])
                         f->nav = (float)atof(it->valuestring);
                     if ((it = cJSON_GetObjectItem(d, "NAVCHGRT")) && cJSON_IsString(it) && it->valuestring[0]) {
@@ -566,12 +594,12 @@ esp_err_t api_fetch_deepseek(DeepSeekData_t *out)
     cJSON *root = cJSON_Parse(resp); free(resp);
     if (!root) return ESP_FAIL;
     cJSON *i;
-    if ((i = cJSON_GetObjectItem(root, "balance")))       out->balance      = (float)i->valuedouble;
-    if ((i = cJSON_GetObjectItem(root, "today_tokens")))  out->today_tokens_m = (float)i->valuedouble / 1e6f;
-    if ((i = cJSON_GetObjectItem(root, "today_cost")))    out->today_cost    = (float)i->valuedouble;
-    if ((i = cJSON_GetObjectItem(root, "month_tokens")))  out->month_tokens_m = (float)i->valuedouble / 1e6f;
-    if ((i = cJSON_GetObjectItem(root, "month_cost")))    out->month_cost   = (float)i->valuedouble;
-    if ((i = cJSON_GetObjectItem(root, "cache_hit_rate")))out->cache_hit_rate = (float)i->valuedouble;
+    if ((i = cJSON_GetObjectItem(root, "balance")) && cJSON_IsNumber(i))       out->balance      = (float)i->valuedouble;
+    if ((i = cJSON_GetObjectItem(root, "today_tokens")) && cJSON_IsNumber(i))  out->today_tokens_m = (float)i->valuedouble / 1e6f;
+    if ((i = cJSON_GetObjectItem(root, "today_cost")) && cJSON_IsNumber(i))    out->today_cost    = (float)i->valuedouble;
+    if ((i = cJSON_GetObjectItem(root, "month_tokens")) && cJSON_IsNumber(i))  out->month_tokens_m = (float)i->valuedouble / 1e6f;
+    if ((i = cJSON_GetObjectItem(root, "month_cost")) && cJSON_IsNumber(i))    out->month_cost   = (float)i->valuedouble;
+    if ((i = cJSON_GetObjectItem(root, "cache_hit_rate")) && cJSON_IsNumber(i))out->cache_hit_rate = (float)i->valuedouble;
     cJSON_Delete(root);
     ESP_LOGI(TAG, "DS bridge: %.2f", out->balance);
     return ESP_OK;

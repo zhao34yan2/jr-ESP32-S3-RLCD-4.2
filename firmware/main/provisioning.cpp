@@ -222,8 +222,16 @@ static void http_task(void *pv)
                 static wifi_ap_record_t rec[16];
                 esp_err_t se = esp_wifi_scan_start(NULL, true);
                 static char body[4096]; int pos = 0;
-                pos += snprintf(body + pos, sizeof(body) - pos,
-                    "<html><head><meta charset=utf-8></head><body><h2>选择 WiFi</h2>");
+                /* 追加宏: 用带符号剩余空间 (sizeof 是无符号, pos 超界会下溢成巨值 -> 越界写);
+                 * snprintf 返回"本应写入"长度, >=rem 说明已截断/写满, 夹住 pos 并停止后续追加. */
+                #define BODY_APPEND(...) do { \
+                    int rem = (int)sizeof(body) - pos; \
+                    if (rem <= 1) { pos = (int)sizeof(body) - 1; break; } \
+                    int _n = snprintf(body + pos, rem, __VA_ARGS__); \
+                    if (_n < 0) break; \
+                    if (_n >= rem) { pos = (int)sizeof(body) - 1; } else { pos += _n; } \
+                } while (0)
+                BODY_APPEND("<html><head><meta charset=utf-8></head><body><h2>选择 WiFi</h2>");
                 if (se == ESP_OK && esp_wifi_scan_get_ap_records(&cnt, rec) == ESP_OK) {
                     if (cnt > 16) cnt = 16;
                     for (int i = 0; i < cnt; i++) {
@@ -232,15 +240,15 @@ static void http_task(void *pv)
                         char enc[128], disp[208];
                         url_encode(enc, sizeof(enc), (const char *)rec[i].ssid);
                         html_escape(disp, sizeof(disp), (const char *)rec[i].ssid);
-                        pos += snprintf(body + pos, sizeof(body) - pos,
+                        BODY_APPEND(
                             "<a href='/?s=%s' style='display:block;padding:8px;border:1px solid #ddd;text-decoration:none;color:#333'>%s</a>",
                             enc, disp);
                     }
                 } else {
-                    pos += snprintf(body + pos, sizeof(body) - pos,
-                        "<p>扫描失败, 请手动输入 WiFi 名称</p>");
+                    BODY_APPEND("<p>扫描失败, 请手动输入 WiFi 名称</p>");
                 }
-                snprintf(body + pos, sizeof(body) - pos, "<br><a href='/'>返回</a></body></html>");
+                BODY_APPEND("<br><a href='/'>返回</a></body></html>");
+                #undef BODY_APPEND
                 http_send(c, "200 OK", "text/html", body);
             } else if (strstr(buf, "POST /save")) {
                 /* 保存配置: 只覆盖 cfg 命名空间的 ssid/pass, 不擦除其它 NVS 数据 */

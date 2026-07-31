@@ -62,8 +62,16 @@ void Lvgl_PortInit(int width, int height, DispFlushCb flush_cb) {
     uint8_t *buffer_2 = NULL;
     buffer_1 = (uint8_t *)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
 	buffer_2 = (uint8_t *)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
-    assert(buffer_1);
-    assert(buffer_2);
+    /* 显式判空 (不靠 assert: NDEBUG 编译时 assert 会被消除, 拿到 NULL 后续渲染写空指针崩溃).
+     * buffer_2 失败可降级为单缓冲 (LVGL FULL 模式支持); buffer_1 失败则无法出图, 明确 abort. */
+    if (!buffer_1) {
+        ESP_LOGE(TAG, "LVGL buffer_1 alloc failed (%u bytes PSRAM) — cannot init display", (unsigned)buffer_size);
+        if (buffer_2) heap_caps_free(buffer_2);
+        abort();
+    }
+    if (!buffer_2) {
+        ESP_LOGE(TAG, "LVGL buffer_2 alloc failed (%u bytes) — falling back to single buffer", (unsigned)buffer_size);
+    }
 
     lv_display_set_buffers(disp, buffer_1, buffer_2, buffer_size, LV_DISPLAY_RENDER_MODE_FULL);
 

@@ -15,7 +15,7 @@ void battery_nvs_cleanup(void);
 int battery_read_pct(void);
 
 /* 读电量 + 算续航趋势, 写入 app 的电池字段 (battery_pct / bat_drop_per_h / bat_est_hours /
- * bat_log_count / bat_charge_pct). 内部按 10 分钟节流采样趋势. ADC 失败返回 false (调用方应保留上次好值). */
+ * bat_log_count). 内部按 10 分钟节流采样趋势. ADC 失败返回 false (调用方应保留上次好值). */
 bool battery_update(AppData_t *app);
 
 #ifdef __cplusplus

@@ -38,6 +38,16 @@ static volatile bool s_night_sleep = false;
 static char s_ip_str[16]  = "0.0.0.0";
 static char s_ssid_str[33] = "";
 
+/* 拷贝 SSID 到 wifi_config 的 uint8_t ssid[32] (无独立 ssid_len 字段).
+ * strlcpy(dst,src,32) 只写 31 字符+NUL, 会把恰好 32 字节的合法 SSID (802.11 上限) 末字截断→连不上.
+ * 改为最多拷 32 字节; 不足 32 才补 NUL, 恰好 32 字节保留全部字符 (依赖调用方已 {0} 清零). */
+static void wifi_copy_ssid(uint8_t dst[32], const char *src)
+{
+    size_t n = strnlen(src, 32);
+    memcpy(dst, src, n);
+    if (n < 32) dst[n] = '\0';
+}
+
 /* ===== WiFi 事件处理 ===== */
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
@@ -93,7 +103,7 @@ void wifi_init_sta(const char *ssid, const char *password)
 
     strlcpy(s_ssid_str, ssid, sizeof(s_ssid_str));   /* 监控屏用 */
     wifi_config_t wifi_config = {0};
-    strlcpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+    wifi_copy_ssid(wifi_config.sta.ssid, ssid);      /* 32字节 SSID 不截断 (见 wifi_copy_ssid) */
     strlcpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
     /* 有密码要求至少 WPA2; 空密码则设 OPEN, 否则连开放热点会被阈值拒绝 */
     wifi_config.sta.threshold.authmode =
@@ -197,7 +207,9 @@ void wifi_stop_sta_reconnect(void)
 {
     s_reconnect_enabled = false;
     s_retry_count = 99;  /* 防止事件处理里再触发重连 */
+    RADIO_LOCK();
     esp_wifi_disconnect();
+    RADIO_UNLOCK();
     ESP_LOGI(TAG, "STA reconnect disabled (for provisioning scan)");
 }
 
@@ -206,18 +218,21 @@ void wifi_stop_sta_reconnect(void)
 void wifi_switch_network(const char *ssid, const char *password)
 {
     wifi_config_t wc = {0};
-    strlcpy((char *)wc.sta.ssid,     ssid,     sizeof(wc.sta.ssid));
+    wifi_copy_ssid(wc.sta.ssid, ssid);   /* 32 字节 SSID 不截断 (见 wifi_copy_ssid) */
     strlcpy((char *)wc.sta.password, password, sizeof(wc.sta.password));
     wc.sta.threshold.authmode =
         (password && password[0]) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     wc.sta.pmf_cfg.capable  = true;
     wc.sta.pmf_cfg.required = false;
     strlcpy(s_ssid_str, ssid, sizeof(s_ssid_str));
+    /* 持射频锁: disconnect/set_config/connect 复合序列, 与夜间省电/短按重连串行化 */
+    RADIO_LOCK();
     s_retry_count = 0;
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     esp_wifi_disconnect();
     esp_wifi_set_config(WIFI_IF_STA, &wc);
     esp_wifi_connect();
+    RADIO_UNLOCK();
     ESP_LOGI(TAG, "Switching to fallback WiFi: %s", ssid);
 }
 
